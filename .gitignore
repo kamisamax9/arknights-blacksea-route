@@ -1,0 +1,51 @@
+# ============================================================
+# arknights-blacksea-route —— skill 包专用 .gitignore
+# 原则：只收「规则 / 代码 / 样例图」，运行产物与本机状态一律不入库。
+# ============================================================
+
+# ── 本机运行时缓存（内含 adb 绝对路径与设备端口，随机器不同）──
+tools/adb.local.json
+
+# ── 凭证：任何环境变量、密钥、证书都不许进版本库 ──────────────
+.env
+.env.*
+*.env
+*.key
+*.pem
+*.pfx
+*.p12
+secrets.*
+credentials.*
+*_secret.json
+
+# ── Python 字节码 / 缓存 / 虚拟环境 ───────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# ── 运行产物（每次对局都在变，不入库）─────────────────────────
+runs/
+runs-archive/
+*.log
+*.tmp
+*.bak
+tmp_*.json
+*.jsonl
+
+# ── 临时截图与中间图（tools/examples/ 下的样例图请保留，别删）──
+_*.png
+tmp_*.png
+*.annotated.png
+
+# ── 编辑器 / 系统垃圾 ────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
