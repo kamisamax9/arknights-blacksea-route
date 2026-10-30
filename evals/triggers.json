@@ -1,0 +1,38 @@
+{
+  "skill": "arknights-blacksea-route",
+  "version": 1,
+  "updated": "2026-10-26",
+  "note": "触发测试：should_trigger=true 的必须加载本 skill；false 的必须不加载（防止被泛化的「路线/规划」拉进来）。",
+  "cases": [
+    {
+      "id": "t1-core",
+      "prompt": "黑流树海，三层，起点（0,2），理想源（6,3），身上有报废轮子×1",
+      "should_trigger": true,
+      "reason": "点名了玩法「黑流树海」，且给出层/起点/理想源/库存——标准开局请求"
+    },
+    {
+      "id": "t2-single-decision",
+      "prompt": "我现在在（2,1），行动力剩 1，去（0,3）还是去（3,0）？",
+      "should_trigger": true,
+      "reason": "没有出现「黑流树海」四个字，但出现的坐标式问法与「这一跳值不值」类单点决策，是本 skill 的核心场景"
+    },
+    {
+      "id": "t3-screenshot",
+      "prompt": "截张图看看我该往哪走",
+      "should_trigger": true,
+      "reason": "指代当前对局并要求截图判断；本 skill 持有 adb/grab 流程"
+    },
+    {
+      "id": "t4-not-this-skill",
+      "prompt": "帮我规划一条从上海到成都的自驾路线，顺便写个 Python 脚本算油费",
+      "should_trigger": false,
+      "reason": "含「路线」「规划」「Python」等词但完全是别的任务，必须不加载（防止关键词误触发）"
+    },
+    {
+      "id": "t5-not-this-skill",
+      "prompt": "明日方舟这个干员的技能倍率怎么算？",
+      "should_trigger": false,
+      "reason": "同属明日方舟，但与集成战略/黑流树海无关"
+    }
+  ]
+}

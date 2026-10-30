@@ -1,0 +1,55 @@
+MIT License
+
+Copyright (c) 2026 The arknights-blacksea-route Authors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+适用范围与排除项 / Scope and Exclusions
+
+The MIT grant above covers all original material created by this project's
+authors: the Python tools under tools/, the documentation (SKILL.md, README.md,
+references/, smallmodel/, CHANGELOG.md), evals/, and the scenario / example
+data authored here.
+
+It does NOT cover material owned by Hypergryph Network Technology Co., Ltd.
+("Hypergryph") or any other third party. Excluded from the MIT grant:
+
+1. Game titles, names and terminology ("Arknights", "Integrated Strategies",
+   "Black Stream Sea of Trees" / 明日方舟 / 集成战略 / 黑流树海), in-game node
+   names, item names and any text taken from the game.
+2. Game screenshots and other game-derived imagery, including every PNG file
+   under tools/examples/ (scene-*.png, glyph-*.png, badge-*.png).
+3. The game's rules, mechanics and numerical values as such. The authors' own
+   descriptions of them are MIT-licensed; the underlying game content is not.
+
+Within references/, these same elements (game names and terminology, node and
+item names, and the numerical values themselves) are likewise excluded from the
+MIT grant, while the prose, chapter structure, tables and derivation method
+authored here remain MIT. See references/LICENSE.md for the itemized split.
+
+Such material is included only for identification, documentation and
+interoperability purposes, is not sublicensed here, and is used on a
+non-endorsement basis. If you redistribute this repository, keep this notice
+intact and do not state or imply that Hypergryph endorses or licenses it.
+
+Third-party dependencies (Pillow, numpy, scipy, rapidocr_onnxruntime,
+onnxruntime, and others) are distributed under their own licenses and are not
+covered by this file.
