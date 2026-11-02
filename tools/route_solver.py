@@ -11,6 +11,17 @@
   python route_solver.py scenario.json --ban 9,3       # 禁掉若干格子再求
   python route_solver.py --check "0,1;0,0" scenario.json   # 只校验徒步段每条边是否存在
   python route_solver.py scenario.json --no-tie-break  # 只要分数，不做同分比价（更快）
+  python route_solver.py scenario.json --profile       # 附搜索诊断（展开数/剪枝/缓存命中/A·B 阶段）
+
+`--profile` 的诊断指标（2026-11-02 加）
+--------------------------------------
+| 指标 | 用途 |
+|---|---|
+| A/B 阶段展开数与耗时 | 判断「同分比价」是不是拖慢整体 |
+| 每阶段生成的走法数 | 与展开数相比，看多少状态其实在剪枝处就死了 |
+| ub 缓存命中率与条目数 | 判断缓存到底有没有用（实测 99%，条目 <7 万，别再加分层缓存） |
+| 上界 / memo / 必走 三类剪枝计数 | 判断哪条剪枝真正在干活 |
+| 每阶段 memo 条目数 | 状态空间的真实大小（远小于「展开数」） |
 
 目标函数是**两段的**：先最大化毛分，再在「毛分相同」的解法里**最小化道具消耗价**。
 第二段（同分比价）只用第一段剩下的时间预算；跑不完会明确标注
@@ -41,6 +52,11 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import rules as R                   # noqa: E402  道具定义/分层定价的唯一真源
+
+# `--profile` 总开关。放模块级是性能决定：热循环里只付一次全局布尔判断；
+# 若改成 `self.profile` 属性查找或 `st["ub_cut"] += 1` 字典自增，
+# 在 2300 万状态上各自要花 1s 以上（2026-11-02 实测）。
+PROFILE = False
 
 DEFAULT_VALUES = {
     # 树根/理想源 15 是「文明开化」口径；普通分队模式的 scenario 由
@@ -222,6 +238,10 @@ def check_path(sc, pts):
 PRICE = {**R.PRICE, "气垫底座A": 4, "气垫底座B": 4}
 
 
+# scenario 缺 "mode" 键时只提醒一次（regress 一个进程要建几十个 Solver，刷屏没用）
+_MISSING_MODE_WARNED = [False]
+
+
 class Solver(object):
     def __init__(self, sc, ban=()):
         self.adj = build_adj(sc["edges"])
@@ -234,6 +254,11 @@ class Solver(object):
         for it in sc.get("items", []):
             try:
                 self.items.append(R.normalize_item(it))
+            except R.BadItem as exc:
+                raise SystemExit(
+                    "!! scenario 的库存条目非法：%s\n"
+                    "   修 scenario 里的 items[]（负数次数 / 字符串 only·exclude / "
+                    "负 bonus 都会被拦，不再静默带进求解）。" % exc)
             except R.UnknownItem as exc:
                 raise SystemExit(
                     "!! 道具「%s」认不出来，scenario 里也没写 cov。\n"
@@ -310,6 +335,19 @@ class Solver(object):
         # 同一句里恢复终点模式（sc["end_mode"]="险路尽头" → final_type 收终点）。
         R.set_mode(sc.get("mode"))
         R.set_end_mode(sc.get("end_mode"))
+        # 2026-11-02 P0：分队/终点/四结局以前就重放了，但**三/五层问询没重放**——
+        # 同进程跑第二份 scenario 时，上一层「三结局=要且前置未获取」「二结局=要」会
+        # 悄悄接管这一份（不报错、只是按错的终点与定价算）。六项必须一起恢复。
+        R.set_three_ending(sc.get("three_ending"))
+        R.set_three_ending_pre(sc.get("three_ending_pre"))
+        R.set_second_ending(sc.get("second_ending"))
+        # 缺 "mode" 键 = 无法区分「N16」与「忘写」。默认按 N16 算会让普通分队局
+        # 白拿 树根 15 分 + 2 AP，所以喊一声（整进程只喊一次，免得 regress 刷屏）。
+        if "mode" not in sc and not _MISSING_MODE_WARNED[0]:
+            _MISSING_MODE_WARNED[0] = True
+            print("!! scenario 没写 \"mode\"（分队模式）→ 按默认 %s 求解。"
+                  "普通分队局必须在场景里写 \"mode\": \"普通分队\"，"
+                  "否则树根按 15 分且 +2 AP，预算会虚高。" % R.mode_label())
         # 二层四结局问询（2026-10-30）：旧 scenario 没有这两个键 → None（旧口径兜底）；
         # 定价与 final_type 已由建场景工具写死，这里只恢复状态供打印/复核。
         R.set_four_ending(sc.get("four_ending"))
@@ -376,6 +414,7 @@ class Solver(object):
                     and self.nodes.get(o) not in ("起点", "已访问")):
                 self.cval[o] = self.cval[q]
         self.acorn_hits = 0
+        self.cut_reason = None          # run() 里写："timeout" / "node_limit" / None
 
         _grant_cells = {q for q in self.grants if q in self.nodes}
         # 橡果格也要 bit：它现在多半是正分，但**带橡果的空地/普通作战**在旧场景里
@@ -406,6 +445,11 @@ class Solver(object):
         # ub 每次都要「剩余价值里最大的 k 个」——预排序后按序取，免去每节点 sort
         self._order = sorted(range(len(self.pval)), key=lambda t: -self.pval[t])
         self.grant_cells = list(_grant_cells)
+        # (bit, AP) 预配对：`budget()` 每个状态都要算一次「未踩的 grant 还能回多少 AP」，
+        # 原来每次都走 `self.bit.get(q)` + `self.grants[q]` 两次字典查找 + 一次集合迭代。
+        # 2026-11-02 实测占 L3-A 的 ~10%（1.7M 次调用 / 1.7s profile），预配对后 -5.6%。
+        self._grant_pairs = tuple((self.bit.get(q, -1), self.grants[q])
+                                  for q in self.grant_cells)
         # 道具「贵贱」：默认 1，可用 scenario 的 "cost" 覆盖（结构性原理这类通用件设 5）。
         # 2026-10-27 二层：只按「件数」记次级目标时，烧 1 次原理和烧 1 次报废假肢等价，
         # 求解器于是拿原理去跳一个假肢就能到的斜邻。必须按代价加权。
@@ -487,6 +531,11 @@ class Solver(object):
         self._cov_cache = {}
         self._adj_pre = {}      # pos -> [(land, bit, val, grant)]，省掉 moves() 里每次的 dict.get
         self._ti = {}           # (cov,pos) -> [(q0, land, bit, val, grant)]，同上（跳跃分支）
+        # items 元组 -> 「免AP次数 + 道具给的AP总量」。**只依赖 items**，却原来每个状态
+        # 都遍历一遍全部道具（2026-11-02 实测：6 件道具 × 2300 万状态 ≈ 5s）。
+        # items 的取值空间很小（各件余量 0..3），命中的都是同一批元组。
+        self._extra_cache = {}
+        self.phase_stats = []   # [(阶段名, 统计 dict)]，供 --profile 打印
 
         # ── 右区改名 vs 道具的 only 前缀 ────────────────────────────
         # 右区格子会被改名成「右区凶戾 / 右区诡秘 …」，而道具的 only 写的是
@@ -543,22 +592,21 @@ class Solver(object):
             self._cov_cache[key] = hit
         return hit
 
-    def _grant_extra(self, mask):
-        """未踩到的 grant 格一共还能回多少 AP（乐观口径）。"""
-        extra = 0
-        for q in self.grant_cells:
-            b = self.bit.get(q, -1)
-            if b < 0 or not (mask >> b) & 1:      # 0 价值的 grant 格（如羽瞰点）永远算作未访问
-                extra += self.grants[q]
-        return extra
-
     def budget(self, mask, ap, bonus=0):
         """乐观可达**步数** = 当前 AP + 未踩 grant + （免AP次数 / 道具给的 AP）。
 
         必走点的可行性判据要用它：只要「还能走几步」都不够覆盖剩下的必走点，就可以剪。
         用乐观口径所以这剪枝是**安全**的（不会剪掉真正走得完的路）。
+
+        grant 部分用 `_grant_pairs`（(bit, AP) 预配对）就地算，**不再单独抽函数**：
+        这是每个状态都要走的路径，一次函数调用 + 两次字典查找在千万级状态上是实打实的
+        开销（2026-11-02 实测 -5.6%）。旧实现 `_grant_extra()` 已删除，别再加回来。
         """
-        return ap + self._grant_extra(mask) + bonus
+        extra = 0
+        for b, v in self._grant_pairs:
+            if b < 0 or not (mask >> b) & 1:
+                extra += v
+        return ap + extra + bonus
 
     def ub_k(self, mask, k):
         """给定「还能走的步数 k」，返回未访问价值里前 k 大之和（可采纳上界）。
@@ -575,9 +623,11 @@ class Solver(object):
         key = (mask, k)
         hit = self._ub_cache.get(key)
         if hit is not None:
-            self._ub_hit += 1
+            if PROFILE:      # 命中率计数只在 --profile 时有意义（1.7M 次属性自增不是白给的）
+                self._ub_hit += 1
             return hit
-        self._ub_miss += 1
+        if PROFILE:
+            self._ub_miss += 1
         total = cnt = 0
         for idx in self._order:
             if not (mask >> idx) & 1:
@@ -599,6 +649,35 @@ class Solver(object):
         **上界不再可采纳，会把最优解剪掉**（审计 bug 3 的连带问题）。
         """
         return self.ub_k(mask, self.budget(mask, ap, bonus))
+
+    def extra_moves(self, items):
+        """剩余免AP件次数 + 剩余「给AP」道具的总和。
+
+        `items` = 各件**剩余次数**的元组（与 dfs 的 items0 同形）。
+        2026-11-02：dfs 热路径只在「这个 items 组合第一次出现」时调它（结果进
+        `_extra_cache`）；solve_scan 算根上界时也调它——两处**必须同一口径**，
+        否则上界不可采纳，会剪掉最优解。
+        """
+        em = 0
+        for i, n in enumerate(items):
+            if n > 0:
+                it = self.items[i]
+                if it["free"]:
+                    em += n                    # 每次免AP件 = 白拿一格
+                if it.get("bonus"):
+                    em += n * int(it["bonus"])
+        return em
+
+    def root_ub(self):
+        """根节点的**可采纳**上界，含免AP件 / 给AP件的 bonus。
+
+        solve_scan 用它判「这一档已摸到上界 = 已证最优」。旧调用方写
+        `s.ub(0, s.ap0)` 漏了 bonus：界偏低，还会被当成「全局上界」。
+        实测 L3-regression-73：旧口径 73，同口径应为 77（多一件免AP背包 = 多一格），
+        据此提前收工是**无效证明**（2026-11-02）。
+        """
+        return self.ub(0, self.ap0,
+                       self.extra_moves(tuple(it["uses"] for it in self.items)))
 
     def _precompute_moves(self):
         """把「徒步邻居」和「每个道具在每个位置的可落点」预计算好。
@@ -664,7 +743,7 @@ class Solver(object):
             return items
         return tuple(1 if u > 0 else 0 for u in items)
 
-    def moves(self, pos, mask, ap, items, adjset, unit_cost=None):
+    def moves(self, pos, mask, ap, items, adjset, unit_cost=None, tie=False):
         """枚举这一步的所有走法。
 
         每个元素 = (得分, 落点, 道具名, 落点后AP, 新mask, 新items, 新增道具价, 非必走标记)。
@@ -677,6 +756,8 @@ class Solver(object):
         lf = self.left_first
         rm = self.right_mask
         bir = self.bit_is_right
+        # 钳制格（五层二结局）通常为空：有它才需要每步调 _clamp_after，否则直接原样带过。
+        has_clamp = bool(self.clamp_at)
         # 徒步**必须有 1 点行动力**：ap=0 时只剩免AP件可动。
         # 2026-10-28 审计连带修：以前这里不看 ap，靠 dfs 的「放宽 1 格」间接挡；
         # 放宽量改成「剩余免AP次数」后就漏了——ap=0 还能徒步，AP 被走到 -3 都不停。
@@ -692,7 +773,7 @@ class Solver(object):
                     nm |= (1 << i_in)
                 out.append((0 if seen else v, land, None,
                             ap - 1 + (0 if seen else gr),
-                            nm, self._clamp_after(land, items), 0,
+                            nm, (self._clamp_after(land, items) if has_clamp else items), 0,
                             1 if (i < 0 or not (mm >> i) & 1) else 0))
         for k, it in enumerate(self.items):
             left = items[k]
@@ -720,12 +801,20 @@ class Solver(object):
                 out.append((v, land, name,
                             ap - step + self.grants.get(land, 0) + bonus,
                             nm,
-                            self._clamp_after(land, tuple(ni)), dc,
+                            (self._clamp_after(land, tuple(ni)) if has_clamp else tuple(ni)), dc,
                             1 if (i < 0 or not (mm >> i) & 1) else 0))
         # 同分时**先走便宜的那步**：这样「贵而先到」的解不会先占住 best、
         # 把后面同分的廉价解挡在剪枝外面（2026-10-28）。
         # 必走格排最前：可行解越早出现，上界剪枝越早收紧（2026-10-28 必走点约束）。
-        out.sort(key=lambda z: (-z[0], z[7], z[6]))
+        #
+        # 阶段 B（tie=True）目标换成「毛分不变、道具价最小」，排序也跟着换：
+        # **先试最便宜的走法**，让「已花价 ≥ 当前最省」这条剪枝尽早生效。
+        # 只改展开顺序、不改任何判据，所以最优性不受影响（2026-11-02 实测：
+        # 三层 A_全道具 状态 2,630,428 → 2,221,555，总时长 −34%，结果逐字不变）。
+        if tie:
+            out.sort(key=lambda z: (z[6], -z[0], z[7]))
+        else:
+            out.sort(key=lambda z: (-z[0], z[7], z[6]))
         return out
 
     def _prune_cycles(self, path):
@@ -770,6 +859,7 @@ class Solver(object):
         分数最优性不受 B 影响：A 已经证明，B 只是锦上添花。
         """
         start_mask = 0
+        self.phase_stats = []       # 同一个 Solver 反复 run() 时不要串场
         for q in self.visited0:
             if q in self.bit:
                 start_mask |= 1 << self.bit[q]
@@ -783,12 +873,20 @@ class Solver(object):
         def search(tie=False, seed=None, t_end=0.0, node_cap=None):
             """tie=False → 阶段A；tie=True → 阶段B（seed = 阶段A 的 (分, 路径, 价)）"""
             st = {"best": [-1, ()], "cost": 1 << 30, "hit": False,
-                  "tie": 0, "expanded": 0, "cut": False}
+                  "tie": 0, "expanded": 0, "cut": False, "cut_reason": None,
+                  # --profile 用；只在 PROFILE=True 时自增（见模块头的说明）
+                  "ub_cut": 0, "memo_cut": 0, "moves": 0, "memo": 0,
+                  "moves_calls": 0, "must_cut": 0, "cost_cut": 0}
             if seed is not None:
                 st["best"] = [seed[0], seed[1]]
                 st["cost"] = seed[2]
             memo = {}
             stack = []      # 路径用栈：每步 append/pop，只在更新最优解时复制一次（性能建议 3）
+            # 2026-11-02：时间截止必须有**全局停止标志**。
+            # 旧写法 `if t_end and not (_n & 1023) ... return` 只退出当次调用，其余
+            # 1023/1024 个兄弟分支照常往下走 —— 实测 max_time=0.05 仍跑满 6.4M 节点、
+            # 11 秒才结束（"限时"形同虚设，solve_scan 的 --budget 也跟着虚设）。
+            stopped = False
 
             def _better(tot, cost, nsteps):
                 """同分/同价时**步数少者优先**：避免靠回头步把 AP 填满（2026-10-30）。"""
@@ -820,12 +918,24 @@ class Solver(object):
                 · **memo 按毛分支配**：key 含 items，同一 key 的道具价必然相同，
                   不会丢掉更便宜的等价状态。
                 """
-                st["expanded"] += 1
-                if node_cap and st["expanded"] > node_cap:
+                nonlocal stopped
+                _n = st["expanded"] = st["expanded"] + 1
+                if node_cap and _n > node_cap:
                     st["cut"] = True
+                    st["cut_reason"] = st["cut_reason"] or "node_limit"
                     return
-                if t_end and time.time() > t_end:
+                # 停止标志要**每一次调用**都判（不能只判 1024 的倍数）：
+                # 只砍「刚好数到 1024」的那个节点，其余分支继续长 —— 等于没停。
+                if stopped:
                     st["cut"] = True
+                    st["cut_reason"] = st["cut_reason"] or "timeout"
+                    return
+                # 时间检查本身仍**每 1024 个状态一次**：单次 monotonic 约 100ns，
+                # 2300 万状态就是 2.3s（约 4%）白花；批量查把粒度换成 ~2.5ms。
+                if t_end and not (_n & 1023) and time.monotonic() > t_end:
+                    stopped = True
+                    st["cut"] = True
+                    st["cut_reason"] = "timeout"
                     return
                 # final / final_type：最后一格即收解并停止；必走点：mask 不齐不收解
                 # （final_type = 险路终点模式：走到任何一个该类节点即可收解，见 __init__）
@@ -838,7 +948,10 @@ class Solver(object):
                         return               # 终点即止
                 elif self.final_types:
                     _t = self.nodes.get(pos)
-                    _ok_better = (not _miss and _better(tot, cost, len(stack)))
+                    # 前置守卫：`_better` 只在「毛分够得着当前最好」时才可能返回 True，
+                    # 否则白调一次（它每个状态都要付一次调用 + 浮点比较）。
+                    _ok_better = (not _miss and tot >= st["best"][0] - EPS
+                                  and _better(tot, cost, len(stack)))
                     if _t in self.final_hard:
                         if _ok_better:
                             st["best"] = [tot, tuple(stack)]
@@ -849,7 +962,7 @@ class Solver(object):
                         # 但**不 return**——继续走也不违规（它本来就可进可出）
                         st["best"] = [tot, tuple(stack)]
                         st["cost"] = cost
-                elif not _miss and _better(tot, cost, len(stack)):
+                elif not _miss and tot >= st["best"][0] - EPS and _better(tot, cost, len(stack)):
                     st["best"] = [tot, tuple(stack)]
                     st["cost"] = cost
                 if max_alts:
@@ -861,50 +974,69 @@ class Solver(object):
                                 for k in list(self.alts)[:2000]:
                                     self.alts.pop(k, None)
                 # 免AP件/bonus 在 ap=0 时仍可能再走：放宽量必须按剩余次数给（见 docstring）
-                _extra_moves = 0
-                for _k in range(len(items)):
-                    if items[_k] > 0:
-                        _it = self.items[_k]
-                        if _it["free"]:
-                            _extra_moves += items[_k]        # 每次免AP件 = 白拿一格
-                        if _it.get("bonus"):
-                            _extra_moves += items[_k] * _it["bonus"]
+                # 这段只依赖 items，按 items 元组缓存（原版每状态遍历全部道具，
+                # 6 件 × 2300 万状态 ≈ 5s，2026-11-02 实测）。
+                _extra_moves = self._extra_cache.get(items)
+                if _extra_moves is None:
+                    # 冷路径：每个 items 组合只进来一次。口径见 extra_moves()；
+                    # 热路径留在这里就地取缓存，不给每个节点加一次函数调用。
+                    _extra_moves = self._extra_cache[items] = self.extra_moves(items)
                 if ap + _extra_moves <= 0:
                     return
                 _k = self.budget(mask, ap, _extra_moves)    # 还能走几步（乐观：含未踩 grant）
                 # 必走点剪枝：一步最多覆盖 1 个新格 → 差得太多就不可能凑齐
-                if _miss and bin(_miss).count("1") > _k:
+                # （bit_count 是 3.10+ 的内建；旧的 bin(x).count("1") 要先生成字符串，
+                #  在千万级状态上是纯浪费，2026-11-02 换掉）
+                if _miss and _miss.bit_count() > _k:
                     self.must_cuts += 1
+                    if PROFILE:
+                        st["must_cut"] += 1
                     return
                 _ub = tot + self.ub_k(mask, _k)
                 bs, bc = st["best"][0], st["cost"]
                 # 剪枝：阶段A 追平即剪；阶段B 追平时还要比道具价。EPS 不可省（见 docstring）
                 if _ub < bs - EPS:
+                    if PROFILE:
+                        st["ub_cut"] += 1
                     return
                 if _ub <= bs + EPS:
                     if not tie:
+                        if PROFILE:
+                            st["ub_cut"] += 1
                         return
                     if bs >= 0 and cost >= bc:
+                        if PROFILE:
+                            st["cost_cut"] += 1
                         return
                     st["tie"] += 1
                 key = (pos, mask, ap, items)   # memo 按毛分支配：key 含 items ⇒ 同 key 同价
                 prev = memo.get(key)
                 if prev is not None and prev >= tot:
+                    if PROFILE:
+                        st["memo_cut"] += 1
                     return
                 memo[key] = tot
                 adjset = self.adj.get(pos, ())
-                for g, q, name, nap, nm, ni, dcost, _mr in self.moves(
-                        pos, mask, ap, items, adjset, unit_cost):
+                # tie 传进 moves：阶段 B 的排序要按「道具价升序」（见 moves 的注释）
+                _mv = self.moves(pos, mask, ap, items, adjset, unit_cost, tie)
+                if PROFILE:
+                    st["moves"] += len(_mv)
+                    st["moves_calls"] += 1
+                for g, q, name, nap, nm, ni, dcost, _mr in _mv:
                     stack.append((q, name, g))
                     dfs(q, nm, nap, ni, tot + g, cost + dcost)
                     stack.pop()
 
             dfs(self.start, start_mask, self.ap0, items0, 0, 0)
+            st["memo"] = len(memo)     # 状态空间的真实大小（远小于「展开数」）
             self.expanded += st["expanded"]
             return st
 
-        t0 = time.time()
+        # 计时一律用 monotonic：time.time() 会被系统校时/夏令时跳变影响，
+        # 而这里的 t0 同时用来算「还剩多少预算」，跳一下就会提前收工或跑飞。
+        t0 = time.monotonic()
         deadline = (t0 + max_time) if max_time and max_time > 0 else 0.0
+        _ta = time.monotonic()
         a = search(t_end=deadline, node_cap=node_limit)
 
         # 必走点走不到 → 清掉约束回落重解，漏了哪些点由调用方显式告警（不装作没事）
@@ -912,24 +1044,30 @@ class Solver(object):
             self.must_dropped = True
             keep = self.must_mask
             self.must_mask = 0
-            remain = (deadline - time.time()) if deadline else 0.0
+            remain = (deadline - time.monotonic()) if deadline else 0.0
             # 回落也要有预算：至少给一点，否则「约束无解」会变成「工具无输出」
-            fallback_end = time.time() + max(remain, min(max_time * 0.5, 20.0) if max_time else 5.0)
+            fallback_end = time.monotonic() + max(remain, min(max_time * 0.5, 20.0) if max_time else 5.0)
             a = search(t_end=fallback_end, node_cap=node_limit)
             self.must_mask = keep
+        self.phase_stats.append(("A", a, time.monotonic() - _ta))
         best = a["best"]
         cost = a["cost"]
         hit = a["cut"]
+        # 截断原因："timeout" / "node_limit" / None（None = 搜索已穷尽）。
+        # 调用方（solve_scan / route）据此区分「没证完」和「已证最优」。
+        self.cut_reason = a.get("cut_reason")
         proven = (cost == 0)    # 没花道具时「最省」是平凡的，无需阶段B
         tried_b = False
         # 阶段B：只在有道具可省、A 已证明最大毛分时跑，且**只用 A 剩下的预算**
         if tie_break and not hit and self.items and cost > 0:
-            remain = (deadline - time.time()) if deadline else 3.0
+            remain = (deadline - time.monotonic()) if deadline else 3.0
             if remain > 0.5:
                 tried_b = True
+                _tb = time.monotonic()
                 b = search(tie=True, seed=(best[0], best[1], cost),
-                           t_end=time.time() + remain,
+                           t_end=_tb + remain,
                            node_cap=min(node_limit, 3000000))
+                self.phase_stats.append(("B", b, time.monotonic() - _tb))
                 proven = not b["cut"]
                 # 同分比较必须带 EPS（浮点），否则更省解换不上来（见 docstring）
                 if (b["best"][0] > best[0] + EPS
@@ -1055,7 +1193,45 @@ def _load_or_die(path):
         raise SystemExit(2)
 
 
+def _print_profile(s):
+    """打印 `--profile` 诊断。**只读已收集的计数，不参与求解**。
+
+    设计口径：优化决策必须建立在「哪一段在花时间」上，而不是猜。
+    2026-11-02 就是靠这几行否掉了两个看起来很合理的建议（Pareto 跨 AP 支配、
+    ub 缓存分层）——实测前者只省 2.5% 状态，后者的缓存条目从来没超过 7 万。
+    """
+    print("-- 搜索诊断（--profile）--")
+    total = 0.0
+    for name, st, secs in s.phase_stats:
+        exp = st["expanded"]
+        calls = st["moves_calls"]
+        total += secs
+        print("  阶段 %-1s：展开 %s ｜ 生成走法 %s 条（%s 次调用，%.0f/次；仅 %.1f%% 的状态要生成）"
+              "｜ memo %s 条 ｜ %.2fs%s"
+              % (name, format(exp, ","), format(st["moves"], ","), format(calls, ","),
+                 (st["moves"] / calls) if calls else 0.0,
+                 100.0 * calls / exp if exp else 0.0, format(st["memo"], ","), secs,
+                 "（撞到上限，未穷尽）" if st["cut"] else ""))
+    if s.phase_stats:
+        a = s.phase_stats[0][1]
+        print("  阶段 A 剪枝：上界 %s ｜ memo %s ｜ 必走 %s"
+              % (format(a["ub_cut"], ","), format(a["memo_cut"], ","),
+                 format(a["must_cut"], ",")))
+        if len(s.phase_stats) > 1:
+            b = s.phase_stats[1][1]
+            print("  阶段 B 剪枝：上界 %s ｜ memo %s ｜ 价≥当前最省 %s"
+                  % (format(b["ub_cut"], ","), format(b["memo_cut"], ","),
+                     format(b["cost_cut"], ",")))
+    n = s._ub_hit + s._ub_miss
+    print("  ub 缓存：命中 %s / 未命中 %s（%.1f%%）｜ 条目 %s ｜ 全部耗时 %.2fs"
+          % (format(s._ub_hit, ","), format(s._ub_miss, ","),
+             100.0 * s._ub_hit / n if n else 0.0, format(len(s._ub_cache), ","), total))
+    if s.must_dropped:
+        print("  !! 必走点无解 → 已回落为无约束求解（漏掉的点在下面报告）")
+
+
 def main():
+    global PROFILE
     args = sys.argv[1:]
     if not args or args[0] in ("-h", "--help"):
         print(__doc__)
@@ -1083,6 +1259,8 @@ def main():
     node_limit = int(args[args.index("--node-limit") + 1]) if "--node-limit" in args else 20000000
     # 只要分数、不做同分比价（省掉第二阶段；重层快 10s 左右）
     tie_break = "--no-tie-break" not in args
+    # 搜索诊断：只影响打印，不影响任何判据（计数本身在热循环里按 PROFILE 开关跳过）
+    PROFILE = "--profile" in args
     # 忽略 scenario 里的必走点（对照实验用：看「不管必走点」的最优解长什么样）
     if "--no-must" in args:
         sc["must"] = []
@@ -1097,6 +1275,8 @@ def main():
     print("总计价值 %g，走了 %d 步 ｜ 展开 %d 个状态，用时 %.2fs%s"
           % (total, len(path), s.expanded, dt,
              "（撞到节点上限/时间上限，结果可能非最优）" if hit else ""))
+    if PROFILE:
+        _print_profile(s)
     # 同分比价：报出这条路线烧掉的**道具价**，以及「最省」是否已被证明。
     # 未证明时必须写清楚——否则会被当成「这就是最省的」。
     lc = getattr(s, "last_cost", None)

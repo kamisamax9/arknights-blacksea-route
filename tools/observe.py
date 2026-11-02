@@ -329,6 +329,12 @@ def main():
                     choices=("自动", "有", "无"),
                     help="三/四/五层右区（熄日余径）有无：默认按格点宽度自动判；"
                          "拿不准时先问玩家「本局是否存在熄日余径？」再传 有/无")
+    ap.add_argument("--badge-none", dest="badge_none", action="store_true",
+                    help="透传给 route.py：**玩家确报本局没有白圈徽章**。徽章检测崩溃时用它把 ❌ "
+                         "降为 ⚠️（橡果/泪之聚落/二结局入口仍未验证）。不确定就别传")
+    ap.add_argument("--labels-confirmed", dest="labels_confirmed", action="store_true",
+                    help="透传给 route.py：**玩家逐格核对过本层节点标签**。判词「输 入」里"
+                         "「节点标签」升为「事实」，✅ 末行不再为 OCR 标签挂「待确认」")
     ap.add_argument("--items", default="")
     ap.add_argument("--grants", default="")
     ap.add_argument("--max-time", type=float, default=240.0)
@@ -414,23 +420,28 @@ def main():
             print(f"层：{layer}（标题「{title}」核对一致）")
 
     # 三结局参数只在三层（且无右区）有意义：**读格子之前**先挡「用错层」。
+    # 返回码与 route.py 一致：2 = 「先去问玩家 / 参数用错」，不是「工具坏了」。
     try:
         R.set_three_ending(a.three_ending)
         R.set_three_ending_pre(a.three_ending_pre)
     except ValueError as exc:
-        raise SystemExit(f"❌ {exc}")
+        print(f"❌ {exc}")
+        return 2
     _e3 = R.layer3_scope_errors(layer)
     if _e3:
-        raise SystemExit("❌ " + "\n   - ".join(_e3))
+        print("❌ " + "\n   - ".join(_e3))
+        return 2
 
     # 五层「二结局」问询（2026-10-31）：先挡「用错层」，是否真有 3 个命运所指要等建格
     try:
         R.set_second_ending(a.second_ending)
     except ValueError as exc:
-        raise SystemExit(f"❌ {exc}")
+        print(f"❌ {exc}")
+        return 2
     _e5 = R.layer5_scope_errors(layer)
     if _e5:
-        raise SystemExit("❌ " + "\n   - ".join(_e5))
+        print("❌ " + "\n   - ".join(_e5))
+        return 2
 
     # 六层有两个完全不同的图（2026-10-30）：
     #   四结局「盲目者所见」5×4；三结局「源流交汇处」6×5（构型名=源流）。
@@ -598,7 +609,8 @@ def main():
            "--layer", str(layer), "--config", str(cfg), "--ap", str(cur_ap),
            "--max-time", str(a.max_time)]
     if start:
-        cmd += ["--start", f"{start[0]},{start[1]}"]
+        cmd += ["--start", f"{start[0]},{start[1]}",
+                "--start-origin", "detected"]   # 小人检测 ≠ 玩家口报（判词按「待确认」计）
     if start_warned:
         cmd += ["--no-learn-start"]      # 起点是猜的 → 别写进 起点表.json
     if a.mode:
@@ -629,6 +641,10 @@ def main():
         cmd += ["--grants", a.grants]
     if a.explain:
         cmd += ["--explain"]             # 转述文案透传（2026-10-29 起 SKILL.md 标准输出）
+    if a.badge_none:
+        cmd += ["--badge-none"]          # 玩家确报无白圈徽章（徽章读崩时降 ❌ → ⚠️）
+    if a.labels_confirmed:
+        cmd += ["--labels-confirmed"]    # 玩家核过节点标签（OCR 待确认 → 事实）
     print("\n" + "─" * 60)
     sys.stdout.flush()
     return subprocess.call(cmd)

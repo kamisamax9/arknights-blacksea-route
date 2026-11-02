@@ -735,6 +735,15 @@ def second_ending_setup(layer, nodes, lm, fate_badge=(), answer=None, node_xy=No
     out["left"], out["right"] = left, right
     out["marker"] = len(left) >= R.SECOND_FATE_MARKER_COUNT
     if not out["marker"]:
+        # 常规五层（本局没拿二结局相关藏品）：左区没有命运所指，但**右区那 1 个仍是本层终点**
+        # （最后 1 点行动力给它）。2026-11-02 修复：这里以前直接 return、final 留 None，
+        # route.py 于是走「读到命运所指但没能定出终点」分支 → **普通五层在全程追猎下必然 ❌**。
+        out["final"] = right[0] if right else None
+        if right:
+            out["notes"].append(
+                "常规五层（左区无命运所指）：终点 = 右区命运所指 "
+                + "、".join(f"({q[0]},{q[1]})" for q in right)
+                + "（最后 1 点行动力给它）")
         return out
     out["clamp"] = list(right)
 
@@ -828,6 +837,227 @@ def nearest_cell(start, targets, edges):
                key=lambda c: (dist.get(c, 10 ** 9), c))
 
 
+RIGHT_ZONE_SRC = {3: "12-三层全图.md", 4: "16-四层全图.md"}
+_RZ_SHAPES = {}
+# 三层边表写成 `(8,Y)-(9,Y)`（Y = 左上角 y，未知量）；四层写成 `(9,4)-(10,4)`（左下角=2 的绝对坐标）。
+_RZ_PAIR_Y = re.compile(
+    r"\(\s*(\d+)\s*,\s*Y(?:([+-])\s*(\d+))?\s*\)\s*-\s*\(\s*(\d+)\s*,\s*Y(?:([+-])\s*(\d+))?\s*\)")
+_RZ_PAIR_XY = re.compile(r"\(\s*(\d+)\s*,\s*(\d+)\s*\)\s*-\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)")
+
+
+def _parse_right_shapes(layer):
+    """从 references 解析**右区形状表** → [{name, cells, edges, empty}]（坐标已归一化）。
+
+    为什么需要它（2026-11-02，玩家第 2 条意见）：
+    `right_zone()` 以前按**四邻接假设**连右区的边，而规则文档里其实有精确形状表，
+    两者直接冲突——`12-三层全图` 明写「构型3 … `(9,Y)` 与 `(9,Y-1)` **不连**（玩家确认）」，
+    四邻接必然把它连上。也就是说旧口径不是「未验证」，是**已知错边**。
+
+    归一化：
+      · 三层（12）：`(x,Y+d)` → `(x, d)`，d ∈ {0,-1,-2}；**空地数 = 格数 − 6**（6 类有效节点）。
+      · 四层（16）：`(x,y)`（文档左下角 y=2）→ `(x, y-2)`；空地数取小节标题里的「+ N 空地」。
+    返回空列表 = 解析失败（调用方回退四邻接，**不许**静默假装查过表）。
+    """
+    layer = int(layer)
+    if layer in _RZ_SHAPES:
+        return _RZ_SHAPES[layer]
+    fn = RIGHT_ZONE_SRC.get(layer)
+    out = []
+    if fn:
+        txt = open(os.path.join(REF, fn), encoding="utf-8").read()
+        if layer == 3:
+            parts = re.split(r"(?m)^###\s*构型(\d+)（(\d+)\s*节点）", txt)
+            # parts = [前言, "1", "7", 段1, "2", "6", 段2, ...]
+            for i in range(1, len(parts) - 2, 3):
+                name, ncells, body = ("构型" + parts[i], int(parts[i + 1]), parts[i + 2])
+                # 只认「边：」那一行（+ 紧随的续行）：下面的 `**（9,Y）与（9,Y-1）不连**`
+                # 用全角括号，正则本来就匹配不到，但仍别把整段扫一遍。
+                ln = [k for k, s in enumerate(body.splitlines()) if s.startswith("边：")]
+                seg = ""
+                if ln:
+                    _ls = body.splitlines()
+                    seg = _ls[ln[0]] + (_ls[ln[0] + 1] if ln[0] + 1 < len(_ls) else "")
+                edges, cells = [], set()
+                for ux, us, ud, vx, vs, vd in _RZ_PAIR_Y.findall(seg):
+                    du = -int(ud) if us == "-" else int(ud or 0)
+                    dv = -int(vd) if vs == "-" else int(vd or 0)
+                    u, v = (int(ux), du), (int(vx), dv)
+                    edges.append((u, v))
+                    cells.update((u, v))
+                if edges:
+                    out.append({"name": name, "cells": cells, "edges": edges,
+                                "empty": max(0, ncells - 6)})
+        else:
+            parts = re.split(
+                r"(?m)^###\s*构型(\d+)（(\d+)\s*格：(\d+)\s*节点\s*\+\s*(\d+)\s*空地）", txt)
+            # parts = [前言, "1", "8", "7", "1", 段1, "2", "9", "7", "2", 段2, ...]（4 个捕获组）
+            for i in range(1, len(parts) - 4, 5):
+                name, nempty, body = ("构型" + parts[i], int(parts[i + 3]), parts[i + 4])
+                # 只取**第一段**：紧跟在标题后的边表行。下面「形状：…」那句散文里
+                # 会把 `(11,3)-(11,2)` 再写一遍，整段扫会多数一条边（构型1 变 10 条）。
+                seg = next((b for b in body.split("\n\n") if b.strip()), "")
+                edges, cells = [], set()
+                for x1, y1, x2, y2 in _RZ_PAIR_XY.findall(seg):
+                    u, v = (int(x1), int(y1) - 2), (int(x2), int(y2) - 2)
+                    edges.append((u, v))
+                    cells.update((u, v))
+                if edges:
+                    out.append({"name": name, "cells": cells, "edges": edges, "empty": nempty})
+    _RZ_SHAPES[layer] = out
+    return out
+
+
+EDGE_MIN = 4.5          # 「这条边画出来了」的灰度对比阈值（实拍：有线 8–21，无线 −2.5–0.2）
+EDGE_MARGIN = 2         # 探针定案要求领先第二名多少分（把「两个形状都有这条边」的噪声挡住）
+
+
+def match_right_shape(layer, observed, dots=(), probe=None):
+    """把右区**读到的有标签格子**（+ 空地圆点）匹配到形状表。
+
+    返回 `(how, name, cells, edges, dropped)`：
+      · `table`     —— 唯一解，或「多种形状但**边集完全一致**」（同样安全）→ 用表里边；
+      · `ambiguous` —— 多个形状给出**不同**边集（空地落在哪种格子看不出来）→ 不许猜；
+      · `none`      —— 没有任何形状对得上（OCR 漏检/多检，或右区不在预期位置）。
+    `dropped` = 形状表里有、但**这次接不进图**的边：它们的端点落在**未探知的格**上
+    （右区空地不写字；没报 `--right-dots` 时光凭形状只能知道「有几个空地」，不知道「在哪」，
+    那一格就没法作为图里的节点，连到它的边只能丢）。**不是**「空地是硬墙」丢的——
+    空地是 0 分中继、可穿过。调用方要把条数写进说明/判词：这些边缺着，结论会**偏保守**
+    （右区可能少一条通路）。
+
+    `dots`（2026-11-02 新增）：右区空地圆点坐标。**给了 dots 就走精确匹配**——
+    `observed | dots` 必须**正好等于**某个形状的格子集合；这样形状唯一锁定，
+    三层/四层也能拿到 `table`（否则四层永远多解，只能 ⚠️）。
+    空地按玩家 2026-11-02 澄清是**0 分中继（可穿过）**：形状表里穿过空地的边**保留**，
+    所以**给了 dots 时 `dropped` 恒为空**（所有端点都已知）。`ambiguous` / `none` 时
+    边根本不用，`dropped` 也返回空——别拿它当「缺几条边」的计数。
+    """
+    observed = {tuple(q) for q in observed}
+    dots = {tuple(q) for q in (dots or ())} - observed
+    layer = int(layer)
+    if not observed:
+        return "none", "", set(), [], []
+    if layer == 5:
+        # 五层右区 = 3×3 九格**四邻全连通**（14-五层全图），文档口径与四邻接一致。
+        xs = sorted({q[0] for q in observed})
+        ys = sorted({q[1] for q in observed})
+        if (len(observed) == 9 and len(xs) == 3 and len(ys) == 3
+                and xs[2] - xs[0] == 2 and ys[2] - ys[0] == 2):
+            edges = []
+            for x in xs:
+                for y in ys:
+                    if (x + 1, y) in observed:
+                        edges.append(((x, y), (x + 1, y)))
+                    if (x, y + 1) in observed:
+                        edges.append(((x, y), (x, y + 1)))
+            return "table", "五层3×3", observed, edges, []
+        return "none", "", set(), [], []
+    if dots:
+        exact = []
+        for sh in _parse_right_shapes(layer):
+            for s in range(-3, 9):
+                cells = {(x, s + dy) for (x, dy) in sh["cells"]}
+                if (observed | dots) != cells:
+                    continue
+                eg = {frozenset(((x1, s + d1), (x2, s + d2)))
+                      for (x1, d1), (x2, d2) in sh["edges"]}
+                exact.append((sh["name"], s, eg))
+        if exact:
+            edge_sets = {frozenset(k) for _n, _s, k in exact}
+            names = sorted({n for n, _s, _k in exact})
+            if len(edge_sets) == 1:
+                keep = exact[0][2]
+                return ("table",
+                        ("/".join(names) if len(names) == 1 else "/".join(names) + "（边集一致）"),
+                        observed, [tuple(e) for e in keep], [])
+            # 格集相同、边集不同（典型：四层构型2 vs 构型3）→ **像素连线探针**定案。
+            # 这两张形状表只差「哪两条边存在」，而边画在屏幕上，能量（实拍：有线 8–21、
+            # 无线 −2.5–0.2）。领先不足 EDGE_MARGIN 就照旧判多解。
+            if probe is not None:
+                union = set().union(*[set(k) for _n, _s, k in exact])
+                pres = probe([tuple(sorted(e)) for e in union]) or {}
+
+                def _hit(e):
+                    return 1.0 if pres.get(tuple(sorted(e)), 0.0) > EDGE_MIN else 0.0
+
+                scored = []
+                for n, _s, k in exact:
+                    hit = sum(_hit(e) for e in k)
+                    bad = sum(_hit(e) for e in (union - set(k)))
+                    scored.append((hit - bad, n, k))
+                scored.sort(key=lambda z: -z[0])
+                if len(scored) > 1 and scored[0][0] - scored[1][0] >= EDGE_MARGIN:
+                    _sc, _nm, keep = scored[0]
+                    return ("table", f"{_nm}（像素连线探针定案，{_sc:+g}）",
+                            observed, [tuple(e) for e in keep], [])
+            return "ambiguous", "/".join(names), observed, [], []
+        # 圆点和形状对不上：可能是误检 → 落到下面的无圆点匹配（并如实报多解）
+    cands = []
+    for sh in _parse_right_shapes(layer):
+        for s in range(-3, 9):
+            cells = {(x, s + dy) for (x, dy) in sh["cells"]}
+            if not observed <= cells:
+                continue
+            if len(cells) - len(observed) != sh["empty"]:
+                continue
+            eg_all = {frozenset((u, v)) for u, v in
+                      (((x1, s + d1), (x2, s + d2))
+                       for (x1, d1), (x2, d2) in sh["edges"])}
+            eg = {e for e in eg_all if set(e) <= observed}
+            # 端点落在**未探知格**（右区空地）的边：这一格还不知道坐标，进不了图 →
+            # 这条边这次接不上。**必须报出去**（以前这里默默丢掉、dropped 永远为空，
+            # 于是「已核验」的判词掩盖了「右区可能少一条通路」）。
+            dropped = {tuple(sorted(e)) for e in (eg_all - eg)}
+            cands.append((sh["name"], s, eg, dropped))
+    if not cands:
+        return "none", "", set(), [], []
+    edge_sets = {frozenset(eg) for _n, _s, eg, _d in cands}
+    names = sorted({n for n, _s, _eg, _d in cands})
+    if len(edge_sets) == 1:
+        eg = cands[0][2]
+        # 多个候选形状的 dropped 取**并集**：宁可多报一条「没接进来的边」，不许漏报。
+        # （边集一致时已知格之间的边是确定的；不确定的只有那些端点落在空地里的边。）
+        dropped = sorted(set().union(*[d for _n, _s, _eg, d in cands]))
+        return ("table",
+                ("/".join(names) if len(names) == 1 else "/".join(names) + "（边集一致）"),
+                observed, [(u, v) for u, v in (tuple(e) for e in eg)], dropped)
+    return "ambiguous", "/".join(names), observed, [], []
+
+
+def resolve_right_dots(image_or_im, grid, gx, gy, lm, manual="", auto=False):
+    """右区**空地圆点**坐标：手报优先，其次自动检测（2026-11-02）。
+
+    为什么需要它：三/四层右区里**空地不写字**，没有它 `match_right_shape()` 只能拿到
+    有标签的节点 → 四层（1↔4、2↔3 格集互相包含）**永远多解**，判词只能 ⚠️。
+    报出空地坐标后形状唯一锁定，边表才算「已核验」。
+
+    `manual` = `--right-dots "c,r;c,r"`（玩家口报，**最可靠**）；
+    `auto`   = `--auto-dots`（像素检测，**实验性**：目前的判据只能挑出「格心有一团
+               灰白、整块不够亮」的格子，实拍标定还差一个样本，见 label_ocr.DOT_*）。
+    手报格式错 → 抛 ValueError（调用方按「参数错」判 ❌）。
+    """
+    dots = []
+    for part in filter(None, (manual or "").split(";")):
+        try:
+            dots.append(RS.xy(part))
+        except ValueError as exc:
+            raise ValueError(f"--right-dots 格式错误：{part!r}（{exc}；正确写法 \"c,r;c,r\"）")
+    notes = []
+    if dots:
+        notes.append("右区空地圆点（**手报**，用于锁定形状）："
+                     + "、".join(f"({q[0]},{q[1]})" for q in dots))
+        return dots, notes
+    if auto:
+        try:
+            dots, dn = LO.detect_empty_dots(image_or_im, gx, gy, grid, lm)
+            notes += dn
+            if not dots:
+                notes.append("右区空地圆点：自动检测没找到（阈值保守、且未按实拍标定）"
+                             "——需要就手报 --right-dots c,r;c,r")
+        except Exception as exc:                       # noqa: BLE001  像素检测整体失败
+            notes.append(f"右区空地圆点自动检测失败：{exc}（可手报 --right-dots）")
+    return dots, notes
+
+
 def left_max(layer, cols=None, cfg=None):
     """左区最右列 x（右区 = x > 它）。
 
@@ -853,29 +1083,38 @@ def left_max(layer, cols=None, cfg=None):
     return lm
 
 
-def right_zone(layer, grid, cells, edges, lm=None):
+def right_zone(layer, grid, cells, edges, lm=None, meta=None, dots=(), probe=None):
     """把**右区**（左区构型表之外的那几列）拼进 cells/edges。
 
-    三/四/五层的右区不在左区构型文件里，形状也不规则，所以以**图上实际读到的格子**为准：
-    右区内部按 4 邻接连通，与左区 4 相邻处接一条缝边。
-    （右区连通关系没有构型表可查，这是**假设**，必须显式告警。）
+    2026-11-02（玩家第 2 条意见）**口径变更**：右区连通**不再是四邻接假设**——
+    `12-三层全图` / `16-四层全图` 里有精确形状表（三层 3 构型、四层 4 构型），
+    五层的 3×3 田字也明写「四邻全连通」。现在按形状表连线，只在**匹配不上**时
+    才回退四邻接，并把「未验证」写进 meta 让 route.py 降级判词（⚠️）。
+
+    `dots`（2026-11-02 新增）= 右区**空地圆点**坐标。给了它就能精确锁定形状
+    （四层 1↔4 的格集互相包含，没有圆点会多解）。
+    空地按玩家 2026-11-02 澄清 = **0 分中继（可穿过）**：会作为「空地」格接入图里、
+    并按 `cell_values` 记 0 分；穿过它的形状表边**保留**——但前提是**知道那一格的坐标**：
+    没给 `dots` 时只能知道「有几个空地」，不知道「在哪」，连到它的边接不进图
+    （如实记进 `meta["dropped"]`，判词降 ⚠️；不是「空地是墙」）。
+    调用方要把这些格从 `block` 里豁免（写进 `block_except`），否则求解器会把它们删掉。
+
+    `meta`（可选，dict）会回填：`topology` ∈ {table, ambiguous, none}、`shape`、`dots`、
+    `empty_cells`、`dropped`（没接进图的形状表边；见 `match_right_shape`）。
+    返回 (右区格子列表, 说明列表)——与旧签名一致（selftest 按 2 元组解包）。
 
     `lm` 不传时按 `left_max(layer)` 推。**调用方必须和分阶段求解用同一个 lm**，
     否则「哪些格算右区」两处不一致（L8 就踩过）。
-
-    2026-10-29 修复：右区**节点数固定**（三层 6 / 四层 7 / 五层 9，见 12/16/14）。
-    OCR 漏掉 1 个暗图标时旧代码只在 0 格时提示，会安静地少算一整格（右区作战 21 分）；
-    现在格数对不上固定值就打 ⚠️（route.py 会把它升级为 ❌，build_scenario 打印告警）。
-
-    返回 (右区格子列表, 说明列表)。侧写入 cells/edges。
-    2026-10-28：这段逻辑从 route.py 搬到这儿，两个入口共用一份
-    ——以前 build_scenario 只出左区，同一张图两个入口给出**不同的格子集合**。
     """
+    dots = [tuple(q) for q in (dots or ())]
     if layer not in (3, 4, 5):
         return [], []
     if lm is None:
         lm = left_max(layer)
     extra = sorted({q for q in grid if q[0] > lm})
+    if meta is not None:
+        meta.setdefault("topology", "none")
+        meta["dots"] = dots
     if not extra:
         return [], ["右区：图上没读到缝之后的格子（切一边截图或缺右区？）"]
     notes = []
@@ -884,13 +1123,69 @@ def right_zone(layer, grid, cells, edges, lm=None):
         notes.append(
             f"⚠️ 右区格数 {len(extra)} ≠ 固定构成 {want_n}（{layer} 层应为 {want_n} 节点）"
             f"——多半是 OCR 漏了暗图标/多检了，**先核对截图再算**，否则会安静地少算一整格")
+    if dots:
+        _bad = [q for q in dots if q[0] <= lm]
+        if _bad:
+            notes.append("⚠️ 报来的空地圆点 " + "、".join(f"({q[0]},{q[1]})" for q in _bad)
+                         + " 落在左区 → 右区匹配时忽略")
+            dots = [q for q in dots if q[0] > lm]
+        if meta is not None:
+            meta["dots"] = dots
+        _dup = [q for q in dots if q in set(extra)]
+        if _dup:
+            notes.append("⚠️ 报来的空地圆点 " + "、".join(f"({q[0]},{q[1]})" for q in _dup)
+                         + " 其实读到了标签 → 按节点算，不当空地")
+            dots = [q for q in dots if q not in set(extra)]
+    labeled = list(extra)          # 只有**有标签**的格（空地圆点不算），形状匹配用它
     for q in extra:
         cells.add(q)
-    for q in extra:
-        for du, dv in ((1, 0), (0, 1)):
-            nb = (q[0] + du, q[1] + dv)
-            if nb in extra:
-                edges.append((q, nb))
+    # 空地格也要进图（0 分中继、可穿过）：形状表里的边会用到它们。
+    # 只加进 cells/edges，不计入「右区节点数」校验（那是**有标签**节点的定数）。
+    for q in dots:
+        if q not in extra:
+            extra = sorted(list(extra) + [q])
+            cells.add(q)
+    if meta is not None:
+        meta["empty_cells"] = list(dots)
+    how, name, _cells, eg, dropped = match_right_shape(layer, labeled, dots, probe=probe)
+    if meta is not None:
+        meta["topology"] = how
+        meta["shape"] = name
+        meta["dropped"] = dropped
+    if how == "table":
+        for u, v in eg:
+            edges.append((u, v))
+        _dot_tail = (f"；空地圆点 {len(dots)} 个按**0 分中继**接入（可穿过）" if dots else "")
+        if dropped:
+            # 边缺着不等于「地图上没这条边」：空地位置没报，那一格进不了图。
+            # 判词必须降级（route.py 会把它算进 warnings），不能写「已核验」就完事。
+            # 多个候选形状时 dropped 是并集（见 match_right_shape），说明里点明「最多」。
+            _n_cand = len(name.split("（")[0].split("/"))
+            _n_multi = ("（%d 个候选形状的并集，最多这么多）" % _n_cand if _n_cand > 1 else "")
+            notes.append(
+                f"右区边表：按 references 形状表「{name}」连线 {len(eg)} 条"
+                f"（已知格之间的边已核验）{_dot_tail}。"
+                f"⚠️ 另有 **{len(dropped)} 条边没接进来**{_n_multi}——端点落在**未探知的空地**上"
+                "（没报 --right-dots 时只能知道「有几个空地」，不知道「在哪」）"
+                "→ 右区可能少一条通路，结论会偏保守；报 --right-dots c,r 可锁定并补全")
+        else:
+            notes.append(f"右区边表：按 references 形状表「{name}」连线 {len(eg)} 条"
+                         f"（**已核验**，非四邻接假设）{_dot_tail}")
+    else:
+        # 回退：四邻接（旧口径）。ambiguous = 空地位置看不出来，多种形状边集不同。
+        for q in extra:
+            for du, dv in ((1, 0), (0, 1)):
+                nb = (q[0] + du, q[1] + dv)
+                if nb in extra:
+                    edges.append((q, nb))
+        why = ("形状表解析失败/没有形状对得上" if how == "none"
+               else f"形状多解（{name}）——空地落在哪一格看不出来，边集不一致")
+        if dots:
+            why += f"；已报空地 {len(dots)} 个但仍未唯一对上"
+        notes.append(f"⚠️ 右区边表：**未验证**，按 4 邻接临时假设（{why}）")
+        notes.append("若右区实际有暗线不连通、或有斜向连接，这条假设会让路线错"
+                     "——按形状表人工核一遍（12-三层全图 / 16-四层全图），"
+                     "或把右区空地小圆点的坐标用 --right-dots c,r;c,r 报出来")
     seam = 0
     for q in extra:
         for du, dv in ((1, 0), (-1, 0), (0, 1), (0, -1)):
@@ -898,9 +1193,8 @@ def right_zone(layer, grid, cells, edges, lm=None):
             if nb in cells and nb not in extra:
                 edges.append((q, nb))
                 seam += 1
-    notes += [f"右区 {len(extra)} 格按 **4 邻接假设**连通（左区用构型边表，口径不同）；接缝 {seam} 条",
-              "若右区实际有暗线不连通、或有斜向连接，这条假设会让路线错"
-              "——需要时用 edge_check.py 对截图核验"]
+    if seam:
+        notes.append(f"右区：与左区之间的缝边 {seam} 条（几何 4 邻接，左区最右列 ↔ 右区最左列）")
     return extra, notes
 
 
@@ -1111,6 +1405,7 @@ def read_grid(path, layer, cfg, rows):
     # 橡果=迷藏（记坐标，稍后把 +12 并入所在节点）。必须在建 nodes 之前改写 grid。
     try:
         _bd = LO.apply_badges(im, grid, gx, gy, cols, rows, layer=layer)
+        ginfo["badge_ok"] = True
         for _bn in _bd["notes"]:
             print("  徽章：" + _bn)
         ginfo["acorn"] = _bd["acorn"]
@@ -1124,7 +1419,8 @@ def read_grid(path, layer, cfg, rows):
             print("  迷藏（橡果）：" + "、".join(f"({q[0]},{q[1]})" for q in _bd["acorn"])
                   + f" → 收益 +{R.acorn_value():g} 并入所在节点（带橡果的空地放行）")
     except Exception as _be:
-        print(f"  !! 徽章检测失败：{_be}（不期而遇按普通值算）")
+        ginfo["badge_ok"] = False
+        print(f"  !! 徽章检测失败：{_be}（橡果/泪之聚落/二结局入口定价未验证 → 写入 validation_status）")
     # 起点用**候选 + 构型表核对**：小人画在节点左侧，天生有半格横偏差，
     # 2026-10-28 三层那次偏了整整一列（检测 (1,2)=曲折密道，真实 (0,2)）。
     cands = LO.detect_start_candidates(im, gx, list(reversed(gy)), labels)
@@ -1175,6 +1471,14 @@ def main():
                     choices=("自动", "有", "无"),
                     help="三/四/五层右区（熄日余径）有无：默认按格点宽度自动判；"
                          "拿不准时先问玩家「本局是否存在熄日余径？」再传 有/无")
+    ap.add_argument("--right-dots", dest="right_dots", default="",
+                    help='右区**空地小圆点**坐标（手报，如 "10,3;9,4"）。'
+                         "有了它形状才能唯一锁定（四层 1↔4、2↔3 的格集互相包含，"
+                         "没有空地位置永远多解 → 只能 ⚠️）；空地是 **0 分中继（可穿过）**，"
+                         "报出来才能把穿过它的形状表边接进图里（不报就只能丢边、结论偏保守）")
+    ap.add_argument("--auto-dots", dest="auto_dots", action="store_true",
+                    help="自动检测右区空地圆点（**实验性**，实拍标定还差一个样本；"
+                         "检测不到不报错，只是退化回「多解 → ⚠️」）")
     ap.add_argument("--four-ending", dest="four_ending", default=None,
                     metavar="要|不要",
                     help="**二层必答**：本局是否要打四结局？全程追猎：要=尽头 8；不要=尽头 0、"
@@ -1209,6 +1513,9 @@ def main():
                     help='默认按**件数**："标准引擎:1" = 1 件（耐久 3 次）；'
                          '只剩 N 次要写 "标准引擎:剩1次"，或 "标准引擎:2*1"（2 件各剩 1 次）')
     ap.add_argument("--out", default=None)
+    ap.add_argument("--badge-none", dest="badge_none", action="store_true",
+                    help="玩家口报**本局没有白圈徽章**：徽章检测崩溃时把 validation_status "
+                         "从 INVALID 降为 WARNING（橡果/泪之聚落/二结局入口仍未验证）")
     ap.add_argument("--visited", default="",
                     help="**滚动重算**用的「已经走过/已经触发过的格子」，如 \"6,3;4,0\"。"
                          "这些格子不再计分、其中的起点格 grant 视为已领（见 route.py 同名参数）")
@@ -1319,9 +1626,28 @@ def main():
     # 2026-10-30：**没有右区**（未获取四结局前置藏品）时，左区居中；
     # 不拼右区、不预留 AP、右区必走点/收益全部失效。
     extra_cells, rz_notes = [], []
+    _rz_meta = {}
+    _right_dots, _dot_notes = [], []
     if a.layer in (3, 4, 5):
         if has_right:
-            extra_cells, rz_notes = right_zone(a.layer, grid, cells, edges, lm)
+            try:
+                _right_dots, _dot_notes = resolve_right_dots(
+                    a.image, grid, gx, gy, lm,
+                    manual=a.right_dots, auto=a.auto_dots)
+            except ValueError as exc:
+                raise SystemExit(f"❌ {exc}")
+            for _n in _dot_notes:
+                print("  " + _n)
+            _probe = None
+            if _right_dots:
+                # 格集相同、边集不同的形状（四层 2↔3）只能靠屏幕上的连线定案
+                try:
+                    _probe = LO.make_right_edge_probe(a.image, gx, gy)
+                except Exception as _pe:               # noqa: BLE001  探针是加分项，不是必需
+                    print(f"  ⚠️ 右区连线探针不可用：{_pe}")
+            extra_cells, rz_notes = right_zone(a.layer, grid, cells, edges, lm,
+                                               meta=_rz_meta, dots=_right_dots,
+                                               probe=_probe)
             if not extra_cells:
                 raise SystemExit("❌ 截图是完整宽度、本层应有右区，但右区一格都没读到——"
                                  "可能切边/OCR 漏检；先重截或核对，别生成缺右区的 scenario")
@@ -1449,8 +1775,9 @@ def main():
         fate_badge=ginfo.get("fate_badge") or [],
         answer=R.second_ending(),
         node_xy=RS.xy(a.second_ending_node) if a.second_ending_node else None)
+    _se_prefix = "二结局：" if se.get("marker") else "五层终点："
     for n in se["notes"]:
-        print("  二结局：" + n)
+        print("  " + _se_prefix + n)
     if se.get("error"):
         raise SystemExit("❌ " + se["error"])
 
@@ -1583,6 +1910,16 @@ def main():
     # 逐格价值覆盖 = 五层二结局命运所指（无徽章 7 分 / 不要二结局时带徽章 -99）+ 迷藏橡果（+12）
     _cell_vals = dict(acorn_values or {})
     _cell_vals.update(se.get("cell_values") or {})
+    # 右区空地（2026-11-02 玩家澄清：**0 分中继、可穿过**）：
+    #   ① 必须从 block 里豁免——否则求解器把「空地」当墙删掉，穿过它的边全断；
+    #   ② 逐格价写 0——层表里的「空地」是 -99，那是**左区**硬墙的口径。
+    if _right_dots:
+        _ex = {tuple(x) for x in (block_except or [])} | {tuple(q) for q in _right_dots}
+        block_except = [list(x) for x in sorted(_ex)]
+        for _q in _right_dots:
+            _cell_vals[RS.key_xy(_q)] = 0.0
+        print("  右区空地：" + "、".join(f"({q[0]},{q[1]})" for q in _right_dots)
+              + " 按 **0 分中继**接入（可穿过，已在 block_except 里豁免）")
     if se.get("cell_values"):
         print("  二结局：命运所指逐格定价 "
               + "、".join(f"({RS.xy(k)[0]},{RS.xy(k)[1]})={v:g}"
@@ -1670,6 +2007,41 @@ def main():
             sc["final"] = list(se["left"][0])
         if sc.get("final"):
             print(f"  终点：({sc['final'][0]},{sc['final'][1]})「{nodes.get(RS.key_xy(sc['final']), '?')}」")
+
+    # ── validation_status（2026-11-02，玩家第 1 条意见）──────────────────
+    # build_scenario 是**场景生成器**，出错时允许继续产出 JSON（诊断数据有用），
+    # 但必须把可信度写进文件，不能让下游以为它「已经通过完整校验」：
+    #   VALID   —— 识别与校验都过；
+    #   WARNING —— 有明确标记的假设（右区边表未验证），可以用但要展示风险；
+    #   INVALID —— 关键识别失败（徽章读崩 / 格点越界），不能据此判「可用」。
+    _val_hard, _val_soft = [], []
+    if not ginfo.get("badge_ok", True):
+        _bt = "徽章检测失败：橡果 +12/格、泪之聚落 0 分、五层二结局入口均未验证"
+        if a.badge_none:
+            _val_soft.append(_bt + "（--badge-none：按「无白圈徽章」继续）")
+        else:
+            _val_hard.append(_bt)
+    if not ginfo.get("bounds_ok", True):
+        _val_hard.append("格点拟合越出地图区：坐标基准不可信")
+    if _rz_meta.get("topology") in ("ambiguous", "none"):
+        _val_soft.append("右区（熄日余径）边表未验证：按 4 邻接临时假设"
+                         + (f"（形状多解 {_rz_meta['shape']}）" if _rz_meta.get("shape") else ""))
+    if _rz_meta.get("dropped"):
+        # 2026-11-02 修复：这条以前写的是「已按『空地=硬墙』丢弃」，但空地已改成
+        # **0 分中继**（可穿过）——真正的丢边原因是「空地坐标没报，那一格进不了图」。
+        # 也正因为措辞和口径对不上，这条分支之前永远不触发（dropped 恒为空）。
+        _val_soft.append(
+            f"右区形状表最多有 {len(_rz_meta['dropped'])} 条边的端点落在**未探知的空地**上，"
+            f"没报 --right-dots 接不进图 → 右区可能少一条通路（结论偏保守）")
+    sc["validation_status"] = ("INVALID" if _val_hard
+                               else ("WARNING" if _val_soft else "VALID"))
+    sc["validation_reasons"] = _val_hard + _val_soft
+    # 右区拓扑的可复现记录（2026-11-02）：形状怎么定的、用了哪些空地圆点。
+    if _right_dots:
+        sc["right_dots"] = [[q[0], q[1]] for q in _right_dots]
+    if _rz_meta:
+        sc["right_topology"] = {"how": _rz_meta.get("topology"),
+                                "shape": _rz_meta.get("shape") or ""}
 
     out = a.out or os.path.join(
         RUNS, f"L{a.layer}-c{a.config}-{datetime.datetime.now():%H%M}.json")

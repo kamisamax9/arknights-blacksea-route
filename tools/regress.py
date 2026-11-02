@@ -38,12 +38,32 @@ except Exception:
 
 import route_solver as RS       # noqa: E402
 import build_scenario as BS     # noqa: E402
+import rules as R               # noqa: E402
 
 CASES_PATH = os.path.join(HERE, "..", "evals", "solver_regression.json")
 
 
 def pricing_hash():
-    blob = json.dumps(BS.PRICES, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    """定价指纹：**所有会改变求解结果的规则表**，不只是分层价表。
+
+    2026-11-02 P1：原来只 hash `LAYER_PRICES`（`BS.PRICES` 就是它），于是改
+    `ITEM_DEFS`（道具可达域/价格/免AP）、`GRANT_AP`（树根+2）、`END_FINAL_VALUE`
+    （终点分）、`ACORN_VALUE`（橡果 12）**都不会**提示「定价已变」——
+    分数变了、指纹却还报 ✅，这道闸等于只挡住了一半。
+    """
+    payload = {
+        "LAYER_PRICES": R.LAYER_PRICES,
+        "ITEM_DEFS": R.ITEM_DEFS,
+        "GRANT_AP": R.GRANT_AP,
+        "END_FINAL_VALUE": R.END_FINAL_VALUE,
+        "ACORN_VALUE": R.ACORN_VALUE,
+        "THREE_XIANXING_VALUE": R.THREE_XIANXING_VALUE,
+        "SECOND_FATE_VALUE_DELTA": R.SECOND_FATE_VALUE_DELTA,
+        "RIGHT_COMBAT_QUOTA": R.RIGHT_COMBAT_QUOTA,
+        "RIGHT_HAZARD_EXPECT": R.RIGHT_HAZARD_EXPECT,
+        "MAX_USES": R.MAX_USES,
+    }
+    blob = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
     return hashlib.sha1(blob).hexdigest()[:8]
 
 
@@ -66,6 +86,16 @@ def main():
     print()
 
     bad = 0
+    # 规则不变式先跑：它是毫秒级的，且**先于**分数比对——规则本身自相矛盾时，
+    # 后面「分数对上了」没有意义（2026-11-02 P1，等价于「每次改 rules.py 自动执行」）。
+    inv = R.check_invariants()
+    if inv:
+        print(f"  ❌ 规则不变式未通过：{len(inv)} 条（明细：python tools/rules.py --check）")
+        for m in inv[:5]:
+            print("       - " + m)
+        bad += len(inv)
+    else:
+        print("  ✅ 规则不变式通过")
     cases = [c for c in data["cases"] if c.get("quick")] if a.quick else data["cases"]
     for case in cases:
         path = os.path.join(HERE, case["scenario"])

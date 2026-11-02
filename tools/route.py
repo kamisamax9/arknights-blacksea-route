@@ -21,15 +21,24 @@
 
 输出
 ----
-1. 判定表（起点/构型/格点/自检/定价/AP/回头）
+1. 判定表（起点/构型/格点/自检/定价/AP/回头/**输入可信度**）
 2. 路线
-3. 最后一行：`✅ 可用` 或 `❌ 不可用：原因`
+3. 最后一行：**四态**（2026-11-02 起；不许互相改写）
+
+   | 末行 | exit | 含义 |
+   |---|---|---|
+   | `✅ 可用` | 0 | 有解，且搜索已穷尽（**在本场景模型内**已证最优） |
+   | `⚠️ 有条件可用（N 项风险…）` | 0 | 有解，但**未证明最优**（撞上限/分阶段/多候选）或依赖未验证假设 |
+   | `⏳ 未定：…` | 4 | 预算内**没找到解**且搜索未穷尽 ⇒ **不能判定无解**（旧版误判 ❌） |
+   | `❌ 不可用：原因` | 3 | 识别失败 / 数据矛盾 / **已证无解**（搜索穷尽仍无可行解） |
 4. `--explain`：另附一段「转述文案」（【结论】【下一步】【备选】【再看】【风险】），
    给小模型/执行方**逐字转达**用——文案里不含任何需要自行判断的内容，
    执行方不许改写、不许补充规则。
 """
 import argparse
 import collections
+import contextlib
+import io
 import json
 import os
 import re
@@ -200,6 +209,23 @@ def _adj_after_block(edges, nodes, blocked, except_cells=()):
     return adj
 
 
+def split_right_dots(dots, lm):
+    """把报来的「右区空地圆点」分成 `(右区, 左区)` 两组。
+
+    **左区那组绝不能再往下用**（2026-11-02 修复）：`--right-dots` 的坐标会进
+    `block_except` + `cell_values`（0 分中继）。而**左区**的「空地」是 -99 硬墙
+    （三层起，`values["空地"] = -99` 且 `block`）——一个打错列的坐标就能在左区
+    凭空开出一条 0 分通道，路线会从墙里穿过去，且没有任何报错。
+    `build_scenario.right_zone()` 一直有这道过滤（打「落在左区 → 忽略」），
+    route.py 漏了同一道闸；两个入口必须同口径。
+    """
+    lm = int(lm)
+    keep, bad = [], []
+    for q in dots or ():
+        (keep if tuple(q)[0] > lm else bad).append(tuple(q))
+    return keep, bad
+
+
 def _should_learn_start(problems, n_pre_solve, explicit_start, warned=False):
     """起点表（`learn_start`）的写入判据（2026-10-28 审计「起点表写得太早」）。
 
@@ -242,7 +268,8 @@ def solve_staged(sc, layer, lm, right_cells, max_time):
     # 旧口径：左区每轮 0.6 × max_time、最多 3 轮，右区再给 0.4 × max_time
     # → 最坏 2.2 × max_time（默认 60s 会跑到 130s+），与「max-time」语义不符。
     # 现在按剩余墙钟分配：每段最多用「剩余预算」，预算耗尽就交出已找到的最好解。
-    t0 = time.time()
+    # 2026-11-02：`time.time()` → `time.monotonic()`（deadline 语义；NTP 跳时钟会让它失真）。
+    t0 = time.monotonic()
     deadline = t0 + max(1.0, float(max_time))
 
     # ---------- 左区（先按完整库存解，看能不能自然把手里的件留到右区） ----------
@@ -261,7 +288,10 @@ def solve_staged(sc, layer, lm, right_cells, max_time):
     full = sc.get("items", [])
     # 手写的 scenario 可能只写 {"name","uses"}（没有 cov）→ 这里统一补全，
     # 否则 `_find_entry` 拿不到 cov，会误判「没有件够得着右区」。
-    full = [R.normalize_item(it) for it in full]
+    try:
+        full = [R.normalize_item(it) for it in full]
+    except R.BadItem as e:
+        raise SystemExit("!! scenario 的库存条目非法：%s" % e)
     blocked = sc.get("block") or []    # 空地/密道/三·四层命运所指：死格不能当落点
     blocked_except = sc.get("block_except") or []   # 带橡果的空地：豁免（可落）
     reserved = {}                      # 为了右区而扣出来的件（名字 -> 次数）
@@ -272,7 +302,7 @@ def solve_staged(sc, layer, lm, right_cells, max_time):
     # 不能按「最便宜且覆盖类型合格」——轮子便宜但它只走直线 2 格，
     # 左区终点在 (2,2)、右区在 (8,0) 时就够不着，而原理（任意）能。
     for _round in range(3):
-        remain = deadline - time.time()
+        remain = deadline - time.monotonic()
         if _round > 0 and remain <= 2.0:
             print("  ⚠️ --max-time 预算已耗尽，左区重解提前收手（本次结果可能未复核进区件）")
             break
@@ -330,7 +360,7 @@ def solve_staged(sc, layer, lm, right_cells, max_time):
     s_r = RS.Solver(sc_r)
     # 右区也只许用「剩余预算」——不兼顾总墙钟的话，右区再给一份 0.4×max_time，
     # 整段最坏 2.2×max_time（2026-10-29 修复）
-    right_budget = min(max(3.0, max_time * 0.4), max(1.0, deadline - time.time()))
+    right_budget = min(max(3.0, max_time * 0.4), max(1.0, deadline - time.monotonic()))
     score_r, path_r, hit_r = s_r.run(max_time=right_budget, node_limit=80000000)
 
     # 2026-10-29 修复：右区段的两种失败必须显式带出去，不能被 total 吞掉——
@@ -464,6 +494,12 @@ def resolve_start(start, cfg_start, explicit_start, cand_cells, grid, cells,
     滚动模式下：只校验「当前格在该构型格子里」，构型起点不一致降级为备注。
     """
     warned = False
+    if start is None:
+        # 2026-11-02 修复：小人没检出（或图里根本没有小人）时，以前会把 None 一路带下去——
+        # 滚动分支和判词「输入可信度」里都有 `tuple(start)`，直接 TypeError（traceback + exit 1），
+        # 违反「本文件只出四态判词」的契约。起点是整条路线的前提，缺了就当场判 ❌。
+        problems.append("起点未检测到（禁止猜，用 --start 手报）")
+        return None, True
     if rolling:
         # 滚动模式：起点=当前格，只要求在格子集合内（构型已由层数+地标定死）。
         # 传了 --start 就以人报的为准；没传则用小人检测的结果，**都不许**套成构型进层起点。
@@ -492,9 +528,8 @@ def resolve_start(start, cfg_start, explicit_start, cand_cells, grid, cells,
             notes.append(f"⚠️ {len(ok)} 个候选同时满足「格内+无标签」：{ok[:4]}"
                          "——起点按序取，本次**不写入起点表**（需玩家确认或查起点表）")
             warned = True
-    if start is None:
-        problems.append("起点未检测到（禁止猜，用 --start 手报）")
-    elif cfg_start and tuple(start) != cfg_start:
+    # start 为 None 的情况已在函数开头返回（上面的 `if start is None`），这里只管「有起点但不对」。
+    if cfg_start and tuple(start) != cfg_start:
         if explicit_start:
             problems.append(
                 f"--start 报的是 {tuple(start)}，但构型{config} 的起点是 {cfg_start}"
@@ -609,6 +644,43 @@ def _explain_lines(solver, path, total, args, notes, end_txt, budget, paid, alts
     return out
 
 
+def label_input(confirmed, n_labels):
+    """「节点标签」这一项的可信度（2026-11-02 新增 `--labels-confirmed`）。
+
+    OCR 读出来的节点标签默认是**待确认**——它决定每条路线的分数，却没人看过。
+    玩家逐格核对过之后，这一项才能升成**事实**，`✅` 的末行也才不用再挂它。
+
+    返回 `(名称, 等级, 依据)`；`n_labels == 0`（图上没读到任何标签）时返回 None（不记这一项）。
+    只管节点标签：徽章是像素检测、右区拓扑是形状表、起点是小人检测，各有各的账。
+    """
+    if not n_labels:
+        return None
+    if confirmed:
+        return ("节点标签", "事实", "玩家口报：本层标注已逐格核对（%d 格）" % n_labels)
+    return ("节点标签", "待确认", "OCR %d 格" % n_labels)
+
+
+def verdict(problems, unknown, warnings, pending=(), backs=()):
+    """四态判词的**唯一决策点**（2026-11-02）。返回 `(末行文本, exit code)`；❌ 时文本为 None。
+
+    优先级不能换：**❌ > ⏳ > ⚠️ > ✅**
+      · `problems` = 识别失败 / 数据矛盾 / 已证无解 —— 数据坏了，后面都不用谈；
+      · `unknown`  = 搜索没穷尽且没找到解 —— 不是「无解」，是「判不了」；
+      · `warnings` = 有解但未证明最优 / 依赖未验证假设 —— 条件可用；
+      · 都没有   = 场景模型内已证最优；但仍要标出「有 N 项输入待确认」。
+    抽成函数是给 selftest 用的：这四种末行是**对外契约**，不能只靠人试。
+    """
+    if problems:
+        return None, 3
+    if unknown:
+        return "⏳ 未定（搜索没跑完，**不能判定无解**）", 4
+    if warnings:
+        # ⚠️ 仍 exit 0（不是错，是**条件可用**），但下游必须把风险一起转达。
+        return (f"⚠️ 有条件可用（{len(warnings)} 项风险，见上「风 险」栏——不是完整绿灯）", 0)
+    _qual = ("（在本场景模型内已证最优；%d 项输入待确认）" % len(pending)) if pending else ""
+    return "✅ 可用" + _qual + ("（回头步均为必经）" if backs else ""), 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("image")
@@ -616,6 +688,11 @@ def main():
     ap.add_argument("--config", required=True)
     ap.add_argument("--ap", type=int, required=True)
     ap.add_argument("--start", default=None)
+    ap.add_argument("--start-origin", dest="start_origin", default="player",
+                    choices=("player", "detected"),
+                    help="--start 的来源：player=玩家口报（事实）；detected=**observe.py 的"
+                         "小人检测**（待确认）。observe 透传时必须写 detected，否则判词会把"
+                         "一个从图上猜出来的坐标算成「玩家口报的事实」")
     ap.add_argument("--mode", default=None, choices=R.mode_choices(),
                     help="分队模式（SKILL.md 〇·〇）：N16文明开化（内部名「文明开化」）=旧默认"
                          "（通过追猎进入二~六层时大概率出现理想源、+2AP+4藏品，--root 必传；"
@@ -634,6 +711,14 @@ def main():
                     choices=("自动", "有", "无"),
                     help="三/四/五层右区（熄日余径）有无：默认按格点宽度自动判；"
                          "截图/识别拿不准时，先问玩家「本局是否存在熄日余径？」再传 有/无")
+    ap.add_argument("--right-dots", dest="right_dots", default="",
+                    help='右区**空地小圆点**坐标（手报，如 "10,3;9,4"）。'
+                         "四层 1↔4、2↔3 的格集互相包含，没有空地位置**永远多解** → "
+                         "只能 ⚠️；报出来形状唯一锁定，边表才算已核验。"
+                         "空地是 **0 分中继（可穿过）**：报出来才能把穿过它的形状表边接进图，"
+                         "不报就只能丢边、结论偏保守")
+    ap.add_argument("--auto-dots", dest="auto_dots", action="store_true",
+                    help="自动检测右区空地圆点（**实验性**，未按实拍标定；检不到就退回多解 ⚠️）")
     ap.add_argument("--four-ending", dest="four_ending", default=None,
                     metavar="要|不要",
                     help="**二层必答**（玩家手报/截图识别到二层都要先问）：本局是否要打四结局？"
@@ -680,6 +765,15 @@ def main():
                          "二层四结局=要 的「尽头必走」、三层三结局的「先行一步必走」不关）")
     ap.add_argument("--no-learn-start", action="store_true",
                     help="本次不写入起点表（起点是猜的/弱证据时用；observe.py 在候选判据打 ⚠️ 时会带上）")
+    ap.add_argument("--badge-none", dest="badge_none", action="store_true",
+                    help="玩家口报**本局没有白圈徽章**：徽章检测崩溃时用它把 ❌ 降为 ⚠️（"
+                         "橡果 +12 / 泪之聚落 0 分 / 五层二结局入口这三类定价仍未经验证）。"
+                         "不确定就别传——默认按「读失败 = 数据不可信」判 ❌")
+    ap.add_argument("--labels-confirmed", dest="labels_confirmed", action="store_true",
+                    help="玩家**逐格核对过本层图上的节点标签**：判词「输 入」里的「节点标签」"
+                         "从「待确认（OCR）」升为「事实」，✅ 的末行不再为这部分挂「N 项输入待确认」。"
+                         "只管**节点标签**——徽章像素检测、右区拓扑、猜出来的起点不在其内，"
+                         "那几项仍会各自记「待确认」，所以干净的 ✅ 要它们也清掉")
     ap.add_argument("--joint", action="store_true",
                     help="三/四/五层改回「左右区一起求」的整体最优（默认是分阶段求优）")
     ap.add_argument("--max-time", type=float, default=60.0)
@@ -781,6 +875,8 @@ def main():
             return 3
 
     problems = []          # 任何一条都会让整体判 ❌
+    warnings = []          # 不致命、但会改变可信度：最终判「⚠️ 有条件可用」并在判词里列全
+    unknown = []           # 搜索没跑完 ⇒ **不能判定**（⏳ 未定，exit 4）。既不是 ❌ 也不是可用
     notes = []
 
     # ── 1. 读图 ────────────────────────────────────────────────
@@ -824,7 +920,12 @@ def main():
                   "同一局三层的滚动重算沿用答案")
             return 2
     if not ginfo.get("bounds_ok"):
-        notes.append("格点拟合越出地图区（截图/列数可能不对）")
+        # 2026-11-02（玩家第 1 条意见）：格点整体贴到地图边缘 = **坐标基准不可信**。
+        # 这不是「提个醒」，而是整张图的 x/y 都可能整体偏一列/一行——旧版只进 notes，
+        # 于是「格点错了但求解器恰好找得到一条路」照样判 ✅。现在一律 ❌。
+        problems.append("格点拟合越出地图区（截图/列数可能不对）→ **坐标基准不可信**，"
+                        "整条路线不能按这张图算。重截一张：让地图区左右/上下都留出边距，"
+                        "或核对 --layer/--config 是否选错")
     gy = sorted(LO.choose_lattice([l[1] for l in labels], rows, center=0.49 * _H), reverse=True)
     # 小人锚点自证：最左列只有起点（无标签）时整体会右移一列（2026-10-29 一层）。
     gx, gy, _align_note = LO.align_lattice(a.image, labels, gx, gy, cols, rows)
@@ -854,7 +955,18 @@ def main():
             print("  迷藏（橡果）：" + "、".join(f"({q[0]},{q[1]})" for q in acorn_cells)
                   + f" → 收益 +{R.acorn_value():g} 并入所在节点（带橡果的空地放行）")
     except Exception as _be:
-        notes.append(f"徽章检测失败：{_be}（不期而遇按普通值算）")
+        # 2026-11-02（玩家第 1 条意见）：**徽章读失败 ≠ 没有徽章**。
+        # 同一个检测器同时决定三条定价：橡果 +12/格、泪之聚落 0 分、
+        # 五层二结局入口（二结局=不要 时要 -99 硬避；=要 时是本层终点）。
+        # 旧版只进 notes → 徽章全丢也照样判 ✅。现在默认 ❌；
+        # 玩家确报「本局没有白圈徽章」时用 --badge-none 降为 ⚠️（风险仍要展示）。
+        _bmsg = (f"徽章检测失败：{_be}（橡果 +12/格、泪之聚落 0 分、五层二结局入口"
+                 f" 三类定价全部未经验证）")
+        if a.badge_none:
+            warnings.append(_bmsg + " —— --badge-none：按「本局没有白圈徽章」继续")
+        else:
+            problems.append(_bmsg + "。确认本局确实没有白圈徽章就加 --badge-none 重跑；"
+                                    "否则先修截图重截（白圈要完整压在节点上）")
     # 起点：**拿候选列表**，再和构型表核对（不要盲取第一个）
     cands = LO.detect_start_candidates(im, gx, list(reversed(gy)), labels)
     cand_cells = [(c, rows - 1 - r) for c, r in cands]
@@ -879,6 +991,17 @@ def main():
                                         grid, cells, outside_probe, edges,
                                         a.layer, a.config, problems, notes,
                                         rolling=bool(a.visited))
+    if start is None:
+        # 起点是整条路线的前提。以前这里会继续用 `[0, 0]` 兜底把场景建出来：
+        # 既可能算出一条**从假起点出发**的路线，又会在判词「输入可信度」里 `tuple(None)` 崩掉
+        # （2026-11-02 实测：二层构型1 的 (0,0) 恰好是合法格 → TypeError + exit 1）。
+        # 现在直接判 ❌，不再拿占位坐标往下跑。
+        print("❌ 不可用：")
+        for _p in problems:
+            print("   - " + _p)
+        print("   · 起点只能由**玩家口报**或小人检测给出：用 --start c,r；"
+              "滚动重算报**当前所在格**（截图只是佐证，冲突以人报为准）")
+        return 3
 
     # 起点是**硬事实**（玩家 2026-10-28：所有构型的起点都是固定的），
     # 但**写入 `起点表.json` 推迟到整次校验之后**（见 main 末尾）——
@@ -911,15 +1034,59 @@ def main():
     # 2026-10-30：先判本层**有没有右区**——未获取四结局前置藏品时，左区居中、没有右区；
     # 此时不预留 AP、右区必走点/收益全部失效，绝不能按「右区没进去」判 ❌。
     extra_cells, rz_notes = [], []
+    _rz_meta = {}
+    _right_dots = []
     if a.layer in (3, 4, 5):
         if has_right:
-            extra_cells, rz_notes = BS.right_zone(a.layer, grid, cells, edges, lm)
+            try:
+                _right_dots, _dot_notes = BS.resolve_right_dots(
+                    im, grid, gx, gy, lm, manual=a.right_dots, auto=a.auto_dots)
+            except ValueError as exc:
+                problems.append(str(exc))
+                _right_dots, _dot_notes = [], []
+            _right_dots, _bad_dots = split_right_dots(_right_dots, lm)
+            if _bad_dots:
+                problems.append(
+                    "报来的空地圆点落在**左区**：" + "、".join(f"({q[0]},{q[1]})" for q in _bad_dots)
+                    + "——左区「空地」是 -99 的硬墙（不是 0 分中继）。"
+                      "把它当右区空地会凭空开一条通道（路线能从墙里穿过去）。"
+                      "核对 --right-dots 的列号再重跑")
+            for _n in _dot_notes:
+                print("  " + _n)
+            _probe = None
+            if _right_dots:
+                try:
+                    _probe = LO.make_right_edge_probe(im, gx, gy)
+                except Exception as _pe:               # noqa: BLE001  探针是加分项
+                    print(f"  ⚠️ 右区连线探针不可用：{_pe}")
+            extra_cells, rz_notes = BS.right_zone(a.layer, grid, cells, edges, lm,
+                                                  meta=_rz_meta, dots=_right_dots,
+                                                  probe=_probe)
             for n in rz_notes:
                 print("  " + n)
             # 右区格数对不上固定构成（三层 6 / 四层 7 / 五层 9）→ 数据本身不可信。
             if any(n.startswith("⚠️ 右区格数") for n in rz_notes):
                 problems.append("右区格数与固定构成不符（三层 6 / 四层 7 / 五层 9）——"
                                 "先核对截图（多半漏了暗图标），别直接用这份读数求解")
+            # 2026-11-02（玩家第 2 条意见）：**拓扑可信度单独进判词**。
+            # 边表查不到形状（或形状多解）时只能用四邻接假设——求解器仍会给你一条
+            # 「合法于假设图」的路线，但那不等于合法于真实地图。降级为 ⚠️，不判 ✅。
+            if _rz_meta.get("topology") in ("ambiguous", "none"):
+                _sh = _rz_meta.get("shape") or ""
+                warnings.append(
+                    "右区（熄日余径）边表**未验证**：按 4 邻接临时假设"
+                    + (f"（形状多解：{_sh}）" if _sh else "（没有形状对得上，可能漏检）")
+                    + "——右区若有暗线不连通或斜向连接，这条路线就错了。"
+                      "核验办法：按 12-三层全图 / 16-四层全图 人工对一遍，"
+                      "或把右区空地小圆点的坐标报出来")
+            if _rz_meta.get("dropped"):
+                # 形状表对上了（table），但有些边的端点落在**未探知的空地**上：
+                # 那一格没坐标就进不了图，边只能缺着。不是「墙」，是「不知道在哪」。
+                warnings.append(
+                    "右区（熄日余径）最多有 %d 条形状表边**没接进图**——端点落在未探知的空地上"
+                    "（没报 --right-dots，空地位置只能由形状反推）→ 右区可能少一条通路，"
+                    "这条路线偏保守；把空地坐标用 --right-dots c,r 报出来即可补全"
+                    % len(_rz_meta["dropped"]))
             if not extra_cells:
                 problems.append("截图是完整宽度、本层应有右区，但右区一格都没读到——"
                                 "可能切边/OCR 漏检；先重截或核对，别用这份读数求解")
@@ -1108,8 +1275,9 @@ def main():
         fate_badge=fate_badge,
         answer=R.second_ending(),
         node_xy=RS.xy(a.second_ending_node) if a.second_ending_node else None)
+    _se_prefix = "二结局：" if se.get("marker") else "五层终点："
     for n in se["notes"]:
-        print("  二结局：" + n)
+        print("  " + _se_prefix + n)
     if se.get("error"):
         print("❌ 不可用：")
         print("   - " + se["error"])
@@ -1158,6 +1326,11 @@ def main():
     # 碰到任何一个该类节点即结束，「最后一步之前不进该类节点」自动成立）；
     # 全程追猎保持旧口径（五层 final = 命运所指坐标）。
     end_types = R.ending_types(a.layer) if R.is_end_jintou() else ()
+    # 2026-11-02 修复：`end_type` / `end_txt` 以前在下面的「二结局接管」分支**之后**才赋值，
+    # 而那个分支的 print 已经引用了 end_txt → 五层 + 3 个命运所指 + 险路尽头模式 + 已答
+    # `--second-ending` 时抛 UnboundLocalError（traceback + exit 1），违反「一律 ✅/❌」的契约。
+    end_type = end_types[0] if end_types else None      # 主类型（打印/兜底用）
+    end_txt = "/".join(end_types)                       # 判词里列全候选
     # ── 五层·二结局：本层终点由二结局问询决定（**优先于终点模式**；玩家 2026-10-31）──
     # 五层左区出现 3 个命运所指时，「险路尽头」模式要求的「最后一步 = 险路恶敌」不再适用：
     #   二结局=要   → 最后一步 = 左区带徽章的「命运所指」（进入二结局关卡）；
@@ -1168,9 +1341,10 @@ def main():
         print("  二结局：本层终点改由二结局决定"
               f"（五层 3 个命运所指优先于终点模式「{end_txt}」）")
         end_types = ()
+        # 终点已经交给 se["final"]（左区带徽章命运所指）：别让后续判词/--explain 的
+        # 风险段再要求「最后一步 = 险路恶敌」——那会把正确解报成违规。
+        end_type, end_txt = None, ""
     _se_force_joint = bool(_se_override and se["final"][0] <= lm)
-    end_type = end_types[0] if end_types else None      # 主类型（打印/兜底用）
-    end_txt = "/".join(end_types)                       # 判词里列全候选
     if end_types:
         sc["final_type"] = list(end_types)
         # 二层例外：小径=8 时也作为**硬终点**（进入即结束），否则「小径 8 + 尽头 8」会重复计分。
@@ -1269,6 +1443,20 @@ def main():
         if _add:
             must = list(must) + _add
             print("  --no-must：三结局的「先行一步必走」不关，仍锁进 must")
+    if a.no_must and a.layer in (3, 4, 5) and extra_cells:
+        # 2026-11-02（玩家第 6 条意见，裁决 = 保留配额约束）：
+        # 右区作战的**期望**是「m 个名额分 21·need_e + 16·need_p」摊出来的。
+        # 只有把被定价的那几格**全走一遍**，这个摊法才等于真实配额总值；
+        # 关掉必走就会变成「只挑有价格的格子踩」——子集访问时逐格期望被高估
+        # （四层 4 未知 3 名额：模型 17.7/格 vs 真实边际 13.25/格）。
+        # 所以与「二层四结局尽头」「三层先行一步」同口径：--no-must 不关这一条。
+        _rq = [RS.xy(k) for k, t in nodes.items()
+               if RS.xy(k)[0] > lm and t in ("右区作战", "右区紧急作战", "右区凶戾")]
+        _addq = sorted(q for q in _rq if q not in must)
+        if _addq:
+            must = list(must) + _addq
+            print("  --no-must：右区作战**配额约束不关**（否则未知凶戾期望会被高估），"
+                  "仍锁进 must：" + "、".join(f"({q[0]},{q[1]})" for q in _addq))
     # 五层·二结局=要：右区「命运所指」是**必走点**（硬约束；进入后加工品次数强制→1，
     # 所以它在最优解里会自然被排到最后几步——求解器状态带 items，钳制会真的砍后续跳跃）。
     if a.layer == 5 and R.second_ending() is True and se.get("must"):
@@ -1313,6 +1501,15 @@ def main():
     # 两者不会落在同一格（徽章互斥），但合并写法保证后加的不会被覆盖掉。
     _cell_vals = dict(_acorn_vals or {})
     _cell_vals.update(se.get("cell_values") or {})
+    # 右区空地（2026-11-02 玩家澄清：**0 分中继、可穿过**）：
+    # 与 build_scenario 同一口径——block 豁免 + 逐格价 0（层表的「空地」是左区硬墙价）。
+    if _right_dots:
+        _ex = {tuple(x) for x in (_acorn_except or [])} | {tuple(q) for q in _right_dots}
+        _acorn_except = [list(x) for x in sorted(_ex)]
+        for _q in _right_dots:
+            _cell_vals[RS.key_xy(_q)] = 0.0
+        print("  右区空地：" + "、".join(f"({q[0]},{q[1]})" for q in _right_dots)
+              + " 按 **0 分中继**接入（可穿过，block_except 豁免）")
     if _cell_vals:
         sc["cell_values"] = _cell_vals
     if se.get("cell_values"):
@@ -1333,6 +1530,26 @@ def main():
         print("  必走节点：" + "，".join(
             f"({x},{y})={nodes.get(RS.key_xy((x, y)), '?')}" for x, y in must))
 
+    # ── 4.9 场景自检：把「求解器拒收输入」变成 ❌，不许是 traceback ──────
+    # `route_solver.Solver.__init__` 对坏输入一律 `raise SystemExit(...)`（→ exit 1 +
+    # stderr），与「任何检查不过就整体判 ❌ 并说明原因」的契约不符（2026-11-02 实测：
+    # 起点落在被 block 删掉的格上时，整条命令只吐一行 `!! 起点 … 被 block 列表删掉了`）。
+    # 这里在**求解之前**构造一次 Solver（只跑 __init__，不做搜索），顺便吞掉它的
+    # `!! …按不可达处理` 噪音（真求解时还会再打一遍，不重复）。
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            RS.Solver(sc)
+    except SystemExit as exc:
+        print("❌ 不可用：")
+        print("   - 场景自检失败（求解器拒收这份输入）：" + str(exc))
+        print("   · 常见原因：起点/必走点落在 block（空地·密道·命运所指·恶敌）里，"
+              "或 --items 写错了道具名/cov。核对截图与参数后重跑")
+        return 3
+    except Exception as exc:                       # noqa: BLE001  构造期任何异常都算数据问题
+        print("❌ 不可用：")
+        print(f"   - 场景自检异常：{type(exc).__name__}: {exc}")
+        return 3
+
     # 识别/建场景阶段到此为止：此后 problems 里的都是求解与校验类问题。
     # 起点表写入判据（`_should_learn_start`）用它区分「识别出错」和「后续出错」。
     n_pre_solve = len(problems)
@@ -1346,6 +1563,13 @@ def main():
     picked_end = None
     segments = None
     alts_ready = False   # --explain 的备选解是否已随求解收集（仅整体求解分支收集）
+    # 2026-11-02（玩家第 3 条意见）：**把「求解口径」写明**，别让「解得出一条路线」
+    # 被读成「这是最优解」。四种口径：
+    #   STAGED_BEST   分阶段（右区固定预留）——结构性**不是**全局最优；
+    #   CANDIDATE_BEST 二层多候选择优——撞到预算上限，未证明；
+    #   JOINT_BEST    整体求解，但撞到时间/节点上限（结果未必最优）；
+    #   JOINT_PROVEN  整体求解且搜索已穷尽 = 全局最优（在场景模型内）。
+    solution_status = "JOINT_BEST"
     if end_types:
         n_end = sum(1 for t in nodes.values() if t in end_types)
         _hard_txt = "/".join(R.ending_hard_types(a.layer)) or "无"
@@ -1366,11 +1590,22 @@ def main():
     if (a.layer in RIGHT_RESERVE and not a.joint and not end_type and has_right
             and not _se_force_joint):
         # 三/四/五层：**分阶段**——右区先按层固定预留，左区用剩下的
-        res = solve_staged(sc, a.layer, lm, extra_cells, a.max_time)
+        try:
+            res = solve_staged(sc, a.layer, lm, extra_cells, a.max_time)
+        except SystemExit as exc:
+            # 子场景（左/右分区）也可能被求解器拒收：同样走 ❌，不吐 traceback
+            print("❌ 不可用：")
+            print("   - 分阶段求解拒收分区子场景：" + str(exc))
+            return 3
         segments = res["segments"]
         solver = _View(res)
         path, total, hit = solver.path, res["total"], res["hit"]
         cost_info = res.get("cost") or {}
+        solution_status = "STAGED_BEST"
+        warnings.append(
+            "求解口径 = STAGED_BEST（分阶段：右区固定预留、左区余量不结转）——"
+            "**不是全局最优**。跨区组合（左区少拿一点换更便宜的进区件/更好的终点）"
+            "看不到；要最优加 --joint 重跑")
         print(f"  分阶段：右区预留 {RIGHT_RESERVE[a.layer]} 点（--joint 可改为整体求解）")
         # 2026-10-29 修复：右区进不去原来只打 ⚠️（route.py:271），不升级 ❌——
         # 现实中常被右区必走点撞出来，但 --no-must 或右区未探明（没有必走点）时
@@ -1387,11 +1622,21 @@ def main():
     elif (a.layer == 2 and end_cells and not end_type
           and R.four_ending() is True):
         best = None
-        # 每个候选各解一次：**预算要按候选数平分**，否则 2 个候选 = 2 倍耗时。
-        # 四结局=要 时尽头是**必走点**（不是「值 8、可选」）：把 chosen 塞进 must，
-        # 保证「进入一次险路尽头」不会因为旁边有 10 分居民据点就被求解器跳过。
-        per = max(5.0, a.max_time / len(end_cells))
-        for chosen in end_cells:
+        # 每个候选各解一次。2026-11-02（玩家第 5 条意见）：
+        # 旧写法 `per = max(5.0, max_time/n)` 有 **5 秒下限** —— `--max-time 3` + 2 个候选
+        # 实际跑 10 秒，违反 `--max-time` 的**总预算**语义。现在改成共享 deadline：
+        # 每个候选只拿「剩余墙钟 ÷ 剩余候选数」，用光就停（并如实标未解满）。
+        _t0 = time.monotonic()
+        _deadline = _t0 + max(1.0, float(a.max_time))
+        _broke = False
+        for _i, chosen in enumerate(end_cells):
+            _remain = _deadline - time.monotonic()
+            if _remain <= 0 and best is not None:
+                _broke = True
+                print(f"  ⚠️ --max-time {a.max_time:g}s 已耗尽：余下 {len(end_cells) - _i} 个尽头候选"
+                      f"没解 → 本次是**未证明**的最优（加 --max-time 重跑才能比全）")
+                break
+            per = max(0.5, (_remain if _remain > 0 else 0.5) / max(1, len(end_cells) - _i))
             sc_try = json.loads(json.dumps(sc))
             for k in end_cells:
                 sc_try["nodes"][k] = "险路尽头" if k == chosen else "空地"
@@ -1401,6 +1646,13 @@ def main():
             if best is None or t_try > best[0]:
                 best = (t_try, p_try, h_try, s_try, chosen)
         total, path, hit, solver, picked_end = best
+        hit = bool(hit or _broke)
+        # `CANDIDATE_BEST` 以前只写在 _status_txt 里、**从没被赋过值**（死分支）：
+        # 二层多候选一旦解不完，实际报的是 JOINT_BEST，读者看不出「还有些候选根本没解」。
+        if _broke:
+            solution_status = "CANDIDATE_BEST"
+        else:
+            solution_status = "JOINT_BEST" if hit else "JOINT_PROVEN"
         if picked_end and RS.key_xy(RS.xy(picked_end)) not in {RS.key_xy(q) for q in must}:
             must.append(RS.xy(picked_end))   # 终点也是本层必走点（校验/输出都要认）
         print(f"  二层尽头只走一次：{len(end_cells)} 个候选里选 {picked_end}"
@@ -1417,13 +1669,20 @@ def main():
         total, path, hit = solver.run(
             max_time=a.max_time, node_limit=80000000,
             **({"slack": 3.0, "max_alts": 8} if a.explain else {}))
+        # hit=False 是「搜索已穷尽」（route_solver 的 cut_reason=None，上界可采纳）
+        # → 在场景模型内就是**已证最优**；撞到时间/节点上限才降为 JOINT_BEST。
+        solution_status = "JOINT_BEST" if hit else "JOINT_PROVEN"
         alts_ready = bool(a.explain)
     if segments is None:
         path = RS.resolve_items(path, list(solver.items))
+    # 「本次没解出路线」的判据（2026-11-02）：total<0 是求解器的无解哨兵。
+    # 一旦成立，下游那些**针对路线**的校验（必走点覆盖/回头步/右区必进/AP 结余）
+    # 全都失去意义——空路线必然「漏必走点」，会把 ⏳ 未定硬拽成 ❌ 不可用。
+    no_solution = total < 0
     # 三结局：先行一步藏着时，路线至少要走一个候选格才有机会探明它。
     # 不升级成 ❌（玩家可能本来就打算下一步再去找，或候选是 OCR 漏检），
     # 但必须**明说**——否则「15 分必走点」看起来像已经安排好了。
-    if xianxing_cands:
+    if xianxing_cands and not no_solution:
         _cand_qs = {q for q, _d in xianxing_cands}
         if not any(q in _cand_qs for q, _it, _cv in path):
             notes.append("这条路线一格「先行一步」候选都没经过 → 拿不到三结局前置收藏品"
@@ -1431,7 +1690,8 @@ def main():
     # 2026-10-29 修复：整体求解（--joint / 终点模式）也要检查「右区必进」——
     # 旧代码只在分阶段分支里查 right_entered，--joint --no-must 时一步不进右区照样 ✅
     # （三层实景实测：分阶段 ❌ 19.8 vs --joint ✅ 35.0）。
-    if segments is None and a.layer in RIGHT_RESERVE and extra_cells:
+    if (segments is None and a.layer in RIGHT_RESERVE and extra_cells
+            and not no_solution):
         if not any(q[0] > lm for q, _it, _cv in path):
             problems.append(
                 "右区（熄日余径）没进去：整体求解同样要求三/四/五层进右区，"
@@ -1439,21 +1699,36 @@ def main():
     # 同分比价的状态（求解器两阶段：先定最大毛分，再在追平前提下压道具价）
     if segments is None:
         cost_info = getattr(solver, "last_cost", None) or {}
-    if hit:
-        problems.append("求解撞到时间/节点上限，结果未必最优（调大 --max-time）")
+    # 2026-11-02 判词语义改造（玩家审阅第 1 条）：
+    # **「预算内没找到解」≠「无解」，也 ≠「不可用」**。旧写法把「撞上限」和「无可行解」
+    # 一起塞进 problems → 一律 `❌ 不可用`（exit 3）；于是一次 --max-time 给少了，
+    # 工具就告诉玩家「这条路不存在」，而实际只是没搜完。现在按「搜索是否穷尽」分三档：
+    #   有解 + 未穷尽 → ⚠️（FEASIBLE：当前最好，未证最优）
+    #   无解 + 未穷尽 → ⏳ 未定（UNKNOWN：不能判定无解，加预算重跑）
+    #   无解 + 已穷尽 → ❌（INFEASIBLE：已证无解）
+    no_solution = total < 0
+    if hit and not no_solution:
+        warnings.append("结果**未证明最优**（求解口径 = %s）：这份是**当前最好**，"
+                        "不是已证最优——要证明就加大 --max-time 重跑" % solution_status)
 
     # ── 6. 校验 ────────────────────────────────────────────────
     # 求解器用 total < 0 表示「无可行解」：设了 final/final_type 却走不到，或没有正收益路线
     if total < 0:
         if end_types:
-            problems.append(
-                f"无可行解：终点模式要求最后一步落在「{end_txt}」，但 AP 内走不到"
-                f"（或图上没有该类节点——确认恶敌/尽头/小径坐标，或用 --final c,r 手报）")
+            _why_none = (f"终点模式要求最后一步落在「{end_txt}」，但 AP 内走不到"
+                         f"（或图上没有该类节点——确认恶敌/尽头/小径坐标，或用 --final c,r 手报）")
         elif a.layer == 2 and R.four_ending() is True:
-            problems.append("无可行解：四结局=要（尽头必走），但 AP 内走不到任何险路尽头"
-                            "（核对构型/镜头坐标，或补跳跃件）")
+            _why_none = ("四结局=要（尽头必走），但 AP 内走不到任何险路尽头"
+                         "（核对构型/镜头坐标，或补跳跃件）")
         else:
-            problems.append("无可行解：设了终点(final)但 AP 内走不到，或没有任何正收益路线")
+            _why_none = "设了终点(final)但 AP 内走不到，或没有任何正收益路线"
+        if hit:
+            solution_status = "UNKNOWN"
+            unknown.append(f"预算内没找到可行解，但搜索**没穷尽**（撞时间/节点上限）——"
+                           f"不能据此判定无解：{_why_none}")
+        else:
+            solution_status = "INFEASIBLE"
+            problems.append(f"无可行解（**已证**：搜索已穷尽）：{_why_none}")
 
     # grant 只在**第一次**踩到那格时结算（与求解器一致）；按每次经过累加会把预算算高
     granted_cells = {q for q, _, _ in path if q in solver.grants}
@@ -1471,7 +1746,7 @@ def main():
         problems.append(f"AP 超支：预算 {budget}（{a.ap}+{granted}"
                         + (f"+道具{item_bonus}" if item_bonus else "")
                         + f"），实走 {paid} 步（共 {len(path)} 步，含免AP）")
-    elif paid < budget:
+    elif paid < budget and not no_solution:
         if end_types and path and solver.nodes.get(path[-1][0]) in end_types:
             # 终点模式：提前落到终点就收尾，剩下的 AP 不是「无处可去」
             notes.append(f"终点已到（最后一步是「{solver.nodes.get(path[-1][0])}」），"
@@ -1526,7 +1801,7 @@ def main():
     # 必走点覆盖：求解器把它当硬约束，这里再独立核一遍（别只信求解器自报）
     must_hit = {q for q, _it, _cv in path}
     must_miss = [q for q in must if q not in must_hit]
-    if must and must_miss:
+    if must and must_miss and not no_solution:
         problems.append(
             "**必走点走不到**：" + "、".join(f"({q[0]},{q[1]})={nodes.get(RS.key_xy(q), '?')}"
                                         for q in must_miss)
@@ -1541,15 +1816,100 @@ def main():
             backs.append((i + 1, q, avoidable(a_, b_, q)))
         seen.add(q)
     waste = [x for x in backs if x[2]]
-    if waste:
+    if waste and not no_solution:
         problems.append("存在**可避免的**回头步：" +
                         "、".join(f"第{s}步({q[0]},{q[1]})" for s, q, _ in waste))
 
+    # ── 6.6 输入可信度（2026-11-02 玩家审阅第 3 条）──────────────
+    # 四类词汇，只标**会改变结论**的输入，不逐条标注全文（标注疲劳之后没人看）：
+    #   事实   = 玩家口报 / 参数显式给出
+    #   推断   = 由定稿表或机械规则推出（构型表、格点宽度、距离带、配额）
+    #   待确认 = 图像识别结果（OCR 标签、小人起点、像素徽章）
+    #   期望   = 经济模型估值（价表）
+    # 铁律：`已证最优`（JOINT_PROVEN）只在**本场景模型内**成立。输入里只要有「待确认」项，
+    # 这句证明就**不覆盖**读错的可能性——所以输入状态必须与判词同场打印，一起转达。
+    inputs = []
+    _start_player = bool(explicit_start) and getattr(a, "start_origin", "player") == "player"
+    # 滚动重算时起点=玩家当前所在格，与构型表的进层起点本来就不同，不能算「未背书」
+    _start_weak = (not _start_player) and (not a.visited) and (
+        start_warned or (start is not None and cfg_start is not None
+                         and tuple(start) != tuple(cfg_start)))
+    if _start_player:
+        inputs.append(("起点", "事实", "玩家口报"))
+    elif _start_weak:
+        inputs.append(("起点", "待确认", "小人检测 + 多候选按序取"))
+    else:
+        inputs.append(("起点", "推断", "小人检测 + 构型表背书"))
+    inputs.append(("层数", "事实", "--layer"))
+    inputs.append(("AP", "事实", "玩家/观测读数"))
+    if a.items:
+        inputs.append(("库存", "事实", "--items"))
+    else:
+        # 没传 --items 时求解器按**空库存**算（不能跳），这是**假设**不是事实。
+        # 以前一律记「事实」，会让读判词的人以为「本局确实没有加工品」。
+        inputs.append(("库存", "推断", "未传 --items：按无道具算"))
+    inputs.append(("构型", "推断", "起点 + 地标查表"))
+    _lab = label_input(bool(getattr(a, "labels_confirmed", False)), len(grid))
+    if _lab:
+        inputs.append(_lab)
+    if forced:
+        inputs.append(("定点节点", "事实", "构型表"))
+    if a.layer in (3, 4, 5):
+        _rz_player = a.right_zone != "自动"
+        inputs.append(("右区有无", "事实" if _rz_player else "推断",
+                       "玩家" if _rz_player else "格点宽度"))
+        if has_right and _rz_meta.get("topology") in ("ambiguous", "none"):
+            inputs.append(("右区拓扑", "待确认", "4 邻接假设"))
+        if has_right and _rz_meta.get("dropped"):
+            # 空地位置是从形状反推的（没报 --right-dots）：不是事实，也不是 OCR。
+            inputs.append(("右区空地", "推断",
+                           "%d 条边的端点靠形状反推（未报 --right-dots）"
+                           % len(_rz_meta["dropped"])))
+    if a.root:
+        inputs.append(("理想源", "事实", "玩家口报"))
+    if a.badge_none:
+        inputs.append(("徽章", "事实", "玩家口报「本局无」"))
+    elif acorn_cells or fate_badge:
+        inputs.append(("徽章", "待确认",
+                       "像素检测 %d 处" % (len(acorn_cells) + len(fate_badge))))
+    if a.final:
+        inputs.append(("终点", "事实", "--final 手报"))
+    inputs.append(("价表", "期望", "rules.LAYER_PRICES"))
+
+    _lv = ("事实", "推断", "待确认", "期望")
+    _cnt = {l: sum(1 for _n, _x, _d in inputs if _x == l) for l in _lv}
+    _pend = [f"{_n}（{_d}）" for _n, _x, _d in inputs if _x == "待确认"]
+    if _start_weak:
+        warnings.append("输入可信度：起点是**小人检测 + 多候选按序取**（构型表没背书）——"
+                        "整条路线的分数都以这个假设为前提；玩家口报 --start 即可消除")
+
     # ── 7. 判词 ────────────────────────────────────────────────
+    # 求解口径的**人话解释**（玩家第 3 条意见：分阶段 ≠ 全局最优，必须写明）
+    _status_txt = {
+        "STAGED_BEST": "分阶段（右区固定预留、左区余量不结转）——**不是全局最优**",
+        "CANDIDATE_BEST": "二层多候选择优——余下候选没解满，未证明",
+        "JOINT_BEST": "整体求解，但撞到时间/节点上限——**未证明最优**",
+        "JOINT_PROVEN": "整体求解且搜索已穷尽 = 全局最优（在本场景模型内）",
+        "INFEASIBLE": "搜索已穷尽仍无可行解 = **已证无解**",
+        "UNKNOWN": "搜索没穷尽就停了 = **不能判定**（加 --max-time 重跑）",
+    }.get(solution_status, solution_status)
+    # 同一条口径的**数学状态**（审阅第 2 条：搜索状态 ≠ 数学上能否证明最优）
+    _state_en = {
+        "JOINT_PROVEN": "OPTIMAL", "JOINT_BEST": "FEASIBLE",
+        "STAGED_BEST": "FEASIBLE", "CANDIDATE_BEST": "FEASIBLE",
+        "INFEASIBLE": "INFEASIBLE", "UNKNOWN": "UNKNOWN",
+    }.get(solution_status, "?")
     print("== 判定 ==")
     print(f"  模　　式：{R.mode_label()}"
           + ("（理想源不保证出现；未报 --root 即按无，打了也不 +2AP）"
              if R.is_normal_squad() else "（通过追猎进入二~六层时大概率出现理想源；--root 必传，推荐搭配全程追猎）"))
+    print(f"  求解口径：{solution_status} = {_state_en}（{_status_txt}）")
+    # 输入可信度紧跟在求解口径之后：**证明的边界**和**结论的强度**必须同场出现，
+    # 否则「已证最优」会被读成「真实地图上也已证最优」。
+    print("  输　　入：" + "｜".join(f"{l} {_cnt[l]}" for l in _lv if _cnt[l]))
+    if _pend:
+        print("  　　　　：" + "、".join(_pend)
+              + " —— 这些是**识别/估计**，不是事实；「已证最优」只在本场景模型内成立")
     print(f"  终点模式：{R.end_mode()}"
           + (f"（本层最后一步 = {end_txt}"
              + (f" → {picked_end}" if picked_end is not None else "") + "）"
@@ -1609,6 +1969,9 @@ def main():
               "这条警告只提醒别漏报）")
     for n in notes:
         print(f"  　　　　：{n}")
+    # 2026-11-02（玩家第 1 条意见）：风险与「备注」分开列——风险会**降级最终判词**。
+    for w in warnings:
+        print(f"  风　　险：{w}")
     print()
     print("== 路线 ==")
     print(solver.fmt(path))
@@ -1641,7 +2004,14 @@ def main():
         print("== 转述文案（--explain 生成；执行方逐字转达，禁止改写或补充规则）==")
         _plan3 = (R.layer3_plan_text(3) if a.layer == 3 and not has_right else "")
         _plan5 = (R.layer5_plan_text(5) if a.layer == 5 and se.get("marker") else "")
-        for ln in _explain_lines(solver, path, total, a, notes, end_txt,
+        # 口径说明已随 warnings 进【风险】（STAGED_BEST 一定有那条），这里不再重复。
+        _exp_notes = list(notes) + list(warnings)
+        # 输入可信度也必须进【风险】：否则 ✅ 的末行写着「N 项输入待确认」，
+        # 而转述文案却说「工具校验全过，无额外风险」——两边自相矛盾（2026-11-02）。
+        if _pend:
+            _exp_notes.append("输入状态：%d 项待确认（%s）——「已证最优」只在本场景模型内成立，"
+                              "不覆盖读错的风险" % (len(_pend), "、".join(_pend)))
+        for ln in _explain_lines(solver, path, total, a, _exp_notes, end_txt,
                                  budget, paid, alts_ready, _plan3, _plan5):
             print(ln)
         print()
@@ -1666,12 +2036,22 @@ def main():
                 print(f"  （起点满足「格内+无标签」，但{why} → 不写入起点表，"
                       "下次通过后再记）")
 
-    if problems:
+    line, code = verdict(problems, unknown, warnings, _pend, backs)
+    if code == 3:
         print("❌ 不可用：")
         for p in problems:
             print("   - " + p)
         return 3
-    print("✅ 可用" + ("（回头步均为必经）" if backs else ""))
+    if code == 4:
+        # 2026-11-02 第 4 态：预算内没解 ≠ 无解。这一态**禁止**被说成「没有路线」，
+        # 也禁止被说成「可用」——正确转述是「没搜完，判不了」。
+        print(line + "：")
+        for u in unknown:
+            print("   - " + u)
+        print("   · 加 --max-time（或 --joint / 放宽约束）重跑才能判；"
+              "在此之前不许当成「❌ 无解」，也不许自己补一条路线")
+        return 4
+    print(line)
     return 0
 
 

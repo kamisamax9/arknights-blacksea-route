@@ -1,7 +1,7 @@
 {
  "skill": "arknights-blacksea-route",
  "note": "求解器回归用例。断言四项：分数、步数、未截断、定价指纹。",
- "pricing_hash": "6382d158",
+ "pricing_hash": "e7ac81b8",
  "cases": [
   {
    "id": "L3-regression-73",

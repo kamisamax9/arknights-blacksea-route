@@ -867,12 +867,187 @@ def assign(labels, gx, gy, cols, rows, max_off=None):
 LINE_REN_LAYERS = (2, 3, 4)
 
 
+def make_right_edge_probe(img_or_im, gx, gy, dy_frac=-0.16, half=0.16):
+    """造一个「两格之间到底有没有连线」的探针：`probe(edges) -> {edge: 灰度对比}`。
+
+    为什么需要（2026-11-02 实拍标定）：`16-四层全图` 的**构型2 与构型3 格集完全相同**
+    （都是 3×3、2 空地），只在两条边上不同 —— 光靠「有标签格 + 空地圆点」永远分不开。
+    但边是**画在屏幕上**的，能量出来：实拍「有线 8–21、无线 −2.5–0.2」，阈值 4.5 分得开。
+
+    采样：`gy` 是文字基线，图标中心在它上方约 0.16 格距；沿连线取中段
+    t∈[0.32,0.68] 避开两端图标，对照带取法线 ±0.16 / ±0.24 格距（避开连线本身）。
+    """
+    from PIL import Image as _Image
+    im = (_Image.open(img_or_im).convert("RGB")
+          if isinstance(img_or_im, (str, bytes)) else img_or_im)
+    g = np.asarray(im, dtype=np.float32)[..., :3].mean(axis=2)
+    sx = sorted(float(v) for v in gx)
+    sy = [float(v) for v in gy]
+    if len(sx) < 2 or len(sy) < 2:
+        return lambda edges: {}
+    sp = (sx[-1] - sx[0]) / (len(sx) - 1)
+    h, w = g.shape
+
+    def _one(e):
+        (x1, y1), (x2, y2) = e
+        p1 = np.array([sx[x1], sy[y1] + dy_frac * sp], dtype=np.float32)
+        p2 = np.array([sx[x2], sy[y2] + dy_frac * sp], dtype=np.float32)
+        d = p2 - p1
+        n = float(np.linalg.norm(d))
+        if n < 1:
+            return 0.0
+        u = d / n
+        nrm = np.array([-u[1], u[0]], dtype=np.float32)
+        vals, ctrls = [], []
+        for t in np.linspace(0.32, 0.68, 19):
+            pt = p1 + d * t
+            for s in (-2, -1, 0, 1, 2):
+                q = pt + u * s
+                xi, yi = int(q[0]), int(q[1])
+                if 0 <= xi < w and 0 <= yi < h:
+                    vals.append(g[yi, xi])
+            for s in (-1, 1):
+                for off in (half * sp, 0.24 * sp):
+                    q = pt + nrm * off * s
+                    xi, yi = int(q[0]), int(q[1])
+                    if 0 <= xi < w and 0 <= yi < h:
+                        ctrls.append(g[yi, xi])
+        if not vals or not ctrls:
+            return 0.0
+        return float(np.mean(vals) - np.mean(ctrls))
+
+    def probe(edges):
+        return {tuple(sorted(e)): _one(tuple(sorted(e))) for e in edges}
+
+    return probe
+
+
 def _grid_put(grid, q, new_type, why):
     """改写 grid[q] 的类型，保留置信度/原始文字；不在 grid 里就新建一条。"""
     cur = grid.get(q)
     conf = cur[1] if cur else 1.0
     raw = (cur[2] if cur else "") or ""
     grid[q] = (new_type, conf, (raw + "；" + why) if raw else why)
+
+
+# ── 右区「空地小圆点」检测（2026-11-02 玩家要求）─────────────────────────
+# 为什么需要：三/四层右区的形状表里，**空地格不写字**，OCR 的 grid 里根本没有它。
+# 于是 `build_scenario.match_right_shape()` 只能拿到「有标签的节点」，
+# 三层永远 6 格、四层永远 7 格 —— 多种形状都说得通（1↔4、2↔3 的格集互相包含），
+# 结果只能是 `ambiguous` + ⚠️。把空地格**测出来**，形状就能唯一锁定 → ✅。
+#
+# 判据（不写字的小圆点 vs 节点图标 vs 背景星点）：
+#   · 节点图标：整块发亮，**外圈也亮** → `ring_dark` 低；
+#   · 背景星点：亮但**面积太小**，中心圆盘里占比 <5% → `core_frac` 低；
+#   · 空地圆点：中心一小块灰白、外圈是暗底 → 两个条件都满足。
+DOT_MIN = 0.55          # 判「这一格有小圆点」的阈值（0–1）
+DOT_RAD = 0.10          # 采样半径 = 0.10 × 格距（圆点本体半径约 0.05）
+DOT_LO, DOT_HI = 80.0, 150.0   # 圆点「最亮像素」区间：低于 = 纯背景，高于 = 节点图标辉光
+
+
+def cell_dot_score(im, cx, cy, sp):
+    """单格「空地小圆点」得分（0–1）。`cx,cy` = 像素中心，`sp` = 格距（像素）。
+
+    实拍形态（2026-11-02 在 20261029-050317 上量的）：空地 = **一圈亮边 + 暗心**的小圆
+    （直径约 0.09 格距），整块最亮像素 100–130；节点图标是**实心辉光**（最亮 220–255）；
+    纯背景最亮 < 60。所以判据是「有亮环（但不够亮）+ 中心不是实心 + 外圈暗」：
+
+      · `DOT_LO ≤ max ≤ DOT_HI`：既不是背景也不是图标；
+      · `mean / max ≤ 0.80`：中间是暗心（实心图标接近 1）；
+      · 外圈中位数 < 45：周围是夜底。
+
+    返回 (score, maxv, ratio, bg)；`score = 1 − |max−中值| / 幅度`，够 0.55 就算圆点。
+    """
+    try:
+        rad = max(8, int(round(DOT_RAD * float(sp))))
+        box = (int(cx - rad), int(cy - rad), int(cx + rad), int(cy + rad))
+        if box[0] < 0 or box[1] < 0 or box[2] > im.width or box[3] > im.height:
+            return 0.0, 0.0, 0.0, 0.0
+        a = np.asarray(im.crop(box), dtype=np.float32)
+    except Exception:
+        return 0.0, 0.0, 0.0, 0.0
+    if a.ndim < 3 or a.shape[0] < 8 or a.shape[1] < 8:
+        return 0.0, 0.0, 0.0, 0.0
+    g = a[..., :3].mean(axis=2)
+    h, w = g.shape
+    yy, xx = np.mgrid[0:h, 0:w]
+    cyy, cxx = (h - 1) / 2.0, (w - 1) / 2.0
+    r = np.sqrt((xx - cxx) ** 2 + (yy - cyy) ** 2) / max(1.0, rad)   # 0–1（rad = 0.10 格距）
+    disc = r <= 0.75
+    ring = (r >= 1.5) & (r <= 2.6)      # 0.15–0.26 格距：外圈（背景）
+    maxv = float(g[disc].max())
+    meanv = float(g[disc].mean())
+    bg = float(np.median(g[ring])) if ring.any() else 0.0
+    if not (DOT_LO <= maxv <= DOT_HI):
+        return 0.0, maxv, (meanv / maxv if maxv else 0.0), bg
+    if meanv / maxv > 0.80 or bg > 45.0:
+        return 0.0, maxv, meanv / maxv, bg
+    # 落在区间中段 + 中心够暗 → 分越高
+    band = 1.0 - abs(maxv - 0.5 * (DOT_LO + DOT_HI)) / (0.5 * (DOT_HI - DOT_LO))
+    score = 0.5 * float(np.clip(band, 0.0, 1.0)) + 0.5 * (1.0 - meanv / maxv)
+    return float(np.clip(score, 0.0, 1.0)), maxv, meanv / maxv, bg
+
+
+def _best_dot_offset(im, cx, cy, sp):
+    """空地圆点在**节点图标中心**，而 OCR 的 gy 是文字基线（约低 0.2 格距）。
+
+    所以竖向扫一段偏移取最好的一格（返回 (score, maxv, ratio, bg, dy_frac)）。
+    """
+    best = (0.0, 0.0, 0.0, 0.0, 0.0)
+    for k in range(-9, 2):
+        dy = k * 0.03 * sp
+        s, mv, rt, bg = cell_dot_score(im, cx, cy + dy, sp)
+        if s > best[0]:
+            best = (s, mv, rt, bg, k * 0.03)
+    return best
+
+
+def detect_empty_dots(img_or_im, gx, gy, cells, lm, rows=None, min_score=DOT_MIN,
+                      max_report=6):
+    """在**右区**（x > lm）找「没有标签、但格心有小圆点」的格子 = 空地候选。
+
+    `cells`：已经有标签的格子（{q: label} 或 set/dict 的 key 都用得上）。
+    `gx,gy`：像素格点（gy **自下而上**，gy[0] = 最下一行，与路线工具一致）。
+    返回 (dots, notes)：dots = [(x,y), …]（按分数降序）；notes = 证据/诊断行。
+
+    只做**证据采集**，不判断这些格子能不能走——能不能走由建场景那边按
+    「空地=硬墙」处理（玩家 2026-11-02 裁决）。真正让它有用的是
+    `build_scenario.match_right_shape()`：**只有能让形状唯一对上的圆点才会被采纳**，
+    所以这里宁可放宽阈值，误检由形状表兜住。
+    """
+    from PIL import Image as _Image
+    im = (_Image.open(img_or_im).convert("RGB")
+          if isinstance(img_or_im, (str, bytes)) else img_or_im)
+    try:
+        keys = set(cells.keys()) if hasattr(cells, "keys") else {tuple(q) for q in cells}
+    except Exception:
+        keys = set()
+    gx = sorted(float(v) for v in gx)
+    # ⚠️ gy **保持调用方的顺序**：`assign()` 约定 cells 的 r 直接索引 gy（gy[0] = 最下一行）。
+    # 2026-11-02 踩过：这里之前又 sorted() 了一次 → 上下翻个个儿，圆点全标到对称的另一行。
+    gy = [float(v) for v in gy]
+    if len(gx) < 2:
+        return [], []
+    sp = (gx[-1] - gx[0]) / max(1, len(gx) - 1)
+    hits = []
+    for xi, px in enumerate(gx):
+        if xi <= int(lm):
+            continue
+        for yi, py in enumerate(gy):
+            q = (xi, yi)                        # gy 自下而上 → y 就是索引
+            if q in keys:
+                continue
+            s, mv, rt, bg, dy = _best_dot_offset(im, px, py, sp)
+            if s >= min_score:
+                hits.append((q, s, mv, rt, dy))
+    hits.sort(key=lambda z: -z[1])
+    notes = []
+    if hits:
+        notes.append(
+            f"右区空地圆点：{len(hits)} 格候选（阈值 {min_score:g}）→ "
+            + "、".join(f"({q[0]},{q[1]})={s:.2f}" for q, s, _m, _r, _d in hits[:max_report])
+            + ("…" if len(hits) > max_report else ""))
+    return [q for q, _s, _m, _r, _d in hits], notes
 
 
 def apply_badges(im, grid, gx, gy, cols, rows, right_from=None, layer=None,

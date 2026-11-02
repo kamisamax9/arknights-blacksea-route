@@ -1178,6 +1178,94 @@ def t_right_zone_count_checked():
         f"5 格时告警={warn5}；6 格（固定构成）无告警={not warn6}")
 
 
+def t_right_zone_shape_table():
+    """2026-11-02（玩家第 2 条意见）：右区边表**按 references 形状表**连，不再一律四邻接。
+
+    锁四条：
+      ① 三层构型3（8 格 2 空地）的观测子集 → `table`，且**不含** `(9,Y)-(9,Y-1)`——
+         文档明写「（9,Y）与（9,Y-1）不连（玩家确认）」，四邻接一定会造出这条假边；
+      ② 四层只有 7 个有标签格时形状多解（四种形状的格集互相包含）→ 必须 `ambiguous`，
+         并回退成 ⚠️ 说明（不许静默当四邻接已验证）；
+      ③ 五层 3×3 九格 = 四邻全连通（文档口径），12 条边；
+      ④ 右区空地 = **0 分中继（可穿过）**（玩家 2026-11-02 澄清）：报出圆点后形状唯一锁定，
+         穿过空地的边**保留**，空地格要能进图（并登记进 `empty_cells` 供上层豁免 block）。
+    """
+    import build_scenario as BS
+
+    # ① 三层构型3，空地 = (8,3)/(8,4)
+    g3 = {(8, 2): ("右区诡秘",), (9, 2): ("命运所指",), (9, 3): ("右区战斗",),
+          (9, 4): ("右区诡秘",), (10, 3): ("右区凶戾",), (10, 4): ("右区作战",)}
+    c3, e3, m3 = set(), [], {}
+    extra3, notes3 = BS.right_zone(3, g3, c3, e3, lm=6, meta=m3)
+    es3 = {tuple(sorted(x)) for x in e3}
+    no_false = ((9, 3), (9, 4)) not in es3 and m3.get("topology") == "table"
+    # 四邻接会加这条（对照：证明测的是「表」不是「邻接」）
+    four_adj_would = abs(9 - 9) + abs(4 - 3) == 1
+
+    # ② 四层 7 个有标签格 → 多解
+    g4 = {(9, 4): ("右区作战",), (10, 4): ("右区作战",), (9, 3): ("右区诡秘",),
+          (10, 3): ("命运所指",), (11, 3): ("右区诡秘",), (10, 2): ("右区诡秘",),
+          (11, 2): ("右区稳妥",)}
+    c4, e4, m4 = set(), [], {}
+    BS.right_zone(4, g4, c4, e4, lm=8, meta=m4)
+    amb_warn = (m4.get("topology") == "ambiguous"
+                and any("右区边表：**未验证**" in n for n in BS.right_zone(
+                    4, g4, set(), [], lm=8)[1]))
+
+    # ③ 五层 3×3
+    g5 = {(x, y): ("右区作战",) for x in (11, 12, 13) for y in (0, 1, 2)}
+    c5, e5, m5 = set(), [], {}
+    BS.right_zone(5, g5, c5, e5, lm=9, meta=m5)
+    ok5 = m5.get("topology") == "table" and len(e5) == 12
+
+    # ④ 2026-11-02：**报出空地圆点后，四层也能唯一锁定**
+    #    没有 dots 时四层恒多解（1↔4、2↔3 格集互相包含）；给了 dots 走精确匹配。
+    sh4 = {s["name"]: s for s in BS._parse_right_shapes(4)}["构型1"]
+    base4 = {(x, 2 + dy) for (x, dy) in sh4["cells"]}       # 构型1 在 Y=2 的 8 格
+    dots4 = [(9, 2)]                                        # 报出空地
+    g4b = {q: ("右区作战",) for q in sorted(base4 - set(dots4))}
+    c4b, e4b, m4b = set(), [], {}
+    _x4, _n4 = BS.right_zone(4, g4b, c4b, e4b, lm=8, meta=m4b, dots=dots4)
+    ok_dots = (m4b.get("topology") == "table"
+               and len(e4b) == len(sh4["edges"])               # 穿过空地的边**保留**
+               and m4b.get("empty_cells") == [(9, 2)]          # 空地格已登记
+               and (9, 2) in {tuple(q) for q in _x4}           # 并进右区格集合
+               and m4b.get("dropped") == [])
+    # 反例：圆点报错位置（和任何形状都对不上）→ 不许硬锁，退回多解/回退
+    bad = [(0, 0)]
+    c4c, e4c, m4c = set(), [], {}
+    BS.right_zone(4, g4b, c4c, e4c, lm=8, meta=m4c, dots=bad)
+    ok_bad = m4c.get("topology") in ("ambiguous", "none")
+
+    # ⑤ 2026-11-02：**格集相同、边集不同**（四层构型2 vs 构型3）→ 像素连线探针定案。
+    #    实拍：有线对比 8–21、无线 −2.5–0.2，故探针阈值 4.5；这里用假探针测**选择逻辑**。
+    sh2 = {s["name"]: s for s in BS._parse_right_shapes(4)}["构型2"]
+    sh3 = {s["name"]: s for s in BS._parse_right_shapes(4)}["构型3"]
+    sh2e = {tuple(sorted(((x1, 2 + a), (x2, 2 + b)))) for (x1, a), (x2, b) in sh2["edges"]}
+    cells33 = {(x, y) for x in (9, 10, 11) for y in (2, 3, 4)}
+    dots33 = [(10, 3), (11, 3)]
+    g33 = {q: ("右区作战",) for q in sorted(cells33 - set(dots33))}
+    c33a, e33a, m33a = set(), [], {}
+    BS.right_zone(4, g33, c33a, e33a, lm=8, meta=m33a, dots=dots33)     # 无探针 → 多解
+    c33b, e33b, m33b = set(), [], {}
+
+    def _fake_probe(edges):
+        return {tuple(sorted(e)): (12.0 if tuple(sorted(e)) in sh2e else 0.0) for e in edges}
+
+    BS.right_zone(4, g33, c33b, e33b, lm=8, meta=m33b, dots=dots33, probe=_fake_probe)
+    ok_probe = (m33a.get("topology") != "table"          # 没探针时不许猜
+                and m33b.get("topology") == "table"      # 探针能定案
+                and "构型2" in (m33b.get("shape") or "")
+                and {tuple(sorted(e)) for e in e33b} == sh2e)
+
+    return (no_false and four_adj_would and amb_warn and ok5 and ok_dots and ok_bad and ok_probe), (
+        f"三层 table={m3.get('topology')} 假边(9,3)-(9,4)={((9,3),(9,4)) in es3}；"
+        f"四层={m4.get('topology')} 有告警={amb_warn}；"
+        f"五层边数={len(e5)}（应 12）；报点后 table={m4b.get('topology')}"
+        f" 边 {len(e4b)}（应 {len(sh4['edges'])}，空地可穿过）={ok_dots}；"
+        f"报错点不硬锁={ok_bad}；探针定案={m33b.get('shape')}（无探针时 {m33a.get('topology')}）={ok_probe}")
+
+
 def t_default_values_match_rules():
     """route_solver.DEFAULT_VALUES 必须与 rules 对齐（2026-10-29 修复 #18 漂移）。
 
@@ -1202,6 +1290,84 @@ def t_default_values_match_rules():
     ok = not drift
     return ok, ("DEFAULT_VALUES 与 LAYER_PRICES 恒定值一致" if ok
                 else "；".join(drift))
+
+
+def t_run_time_limit_really_stops():
+    """run(max_time) 必须**真的**停：旧写法只砍 1/1024 个节点，0.05s 限时跑了 11 秒（2026-11-02 修）。"""
+    import json as _json
+    import time as _t
+    path = os.path.join(HERE, "examples", "L3-run3.json")
+    if not os.path.exists(path):
+        return False, "缺 examples/L3-run3.json"
+    sc = dict(_json.load(open(path, encoding="utf-8")))
+    items = [it for it in sc.get("items", [])
+             if not str(it.get("name", "")).startswith("结构性原理")]
+    sc["items"] = items + [{"name": "结构性原理(扫描1)", "cov": "any", "uses": 1}]
+    s = RS.Solver(sc, ())
+    t0 = _t.monotonic()
+    total, _p, hit = s.run(max_time=0.05)
+    dt = _t.monotonic() - t0
+    ok = hit and s.cut_reason == "timeout" and dt < 1.5
+    return ok, ("上限 0.05s → 实际 %.2fs，hit=%s，reason=%s，score=%g（旧版约 11s）"
+                % (dt, hit, s.cut_reason, total))
+
+
+def t_run_complete_has_no_cut_reason():
+    """跑完的搜索必须 hit=False 且 cut_reason=None——不能被「撞上限」污染。
+
+    旧版时间检查在 1024 的倍数上 `st["cut"]=True` 后只 return 当次调用，
+    搜索其实跑到了底，却对外报 hit=True（solve_scan 因此把"跑完"当"截断"）。
+    """
+    import json as _json
+    sc = _json.load(open(os.path.join(HERE, "examples", "mini-smoke.json"),
+                         encoding="utf-8"))
+    s = RS.Solver(sc, ())
+    total, _p, hit = s.run(max_time=0)
+    ok = (not hit) and s.cut_reason is None
+    return ok, "score=%g hit=%s reason=%s" % (total, hit, s.cut_reason)
+
+
+def _scan_cli(args, timeout=120):
+    """跑一次 solve_scan.py，返回 (exit code, 合并后的输出)。"""
+    import subprocess
+    cmd = [sys.executable, os.path.join(HERE, "solve_scan.py")] + list(args)
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                       encoding="utf-8", errors="replace", timeout=timeout)
+    return p.returncode, p.stdout
+
+
+def t_solve_scan_cov_precedence():
+    """`--cov` 必须压过原型件；不传才沿用原型（2026-11-02 P2）。"""
+    import solve_scan as SS
+    base = {"items": [{"name": "老妈妈的融雪", "uses": 1, "cov": "line2"}]}
+    d = SS.prep(base, [], 2, "老妈妈的融雪", None)["items"][-1]
+    c = SS.prep(base, [], 2, "老妈妈的融雪", "adj8")["items"][-1]
+    u = SS.prep({"items": []}, [], 1, "不存在的道具", None)["items"][-1]
+    has_ex = "作战" in (c.get("exclude") or [])
+    ok = (d["cov"] == "line2" and c["cov"] == "adj8" and has_ex and u["cov"] == "any")
+    return ok, ("不传→%s；显式 adj8→%s（exclude 保留=%s）；未知件→%s"
+                % (d["cov"], c["cov"], has_ex, u["cov"]))
+
+
+def t_solve_scan_truncated_is_not_converged():
+    """截断档不许报「不再增值」。用 --node-limit 做**确定性**截断（2026-11-02 P1）。"""
+    rc, out = _scan_cli([os.path.join(HERE, "examples", "L3-regression-73.json"),
+                         "--node-limit", "800", "--budget", "30",
+                         "--max", "2", "--alts", "0"])
+    ok = (rc == 0 and "未证最优" in out and "NODE_LIMIT" in out
+          and "不再增值" not in out)
+    return ok, ("rc=%d；未证最优=%s / NODE_LIMIT=%s / 误报不再增值=%s"
+                % (rc, "未证最优" in out, "NODE_LIMIT" in out, "不再增值" in out))
+
+
+def t_solve_scan_bound_stop_is_proof():
+    """摸到可采纳上界才是证明：mini-smoke 的 k=0 必须直接报「已证/达界」。"""
+    rc, out = _scan_cli([os.path.join(HERE, "examples", "mini-smoke.json"),
+                         "--budget", "5", "--max", "0", "--alts", "0"])
+    hit_bound = "OPTIMAL(达界)" in out
+    said = "已证：总分 = 可采纳上界" in out
+    return (rc == 0 and hit_bound and said), \
+        "rc=%d；达界=%s；已证文案=%s" % (rc, hit_bound, said)
 
 
 def t_solve_scan_prep_keeps_land():
@@ -2173,6 +2339,206 @@ def t_clamp_items_after_fate():
             f"跳过它 items={jump_over[0][5] if jump_over else None}（应 (2,)）")
 
 
+def t_tie_phase_proves_cost():
+    """阶段 B 必须**真的跑**，并把「最省」标记为已证明。
+
+    2026-11-02 实际踩过：重构 `run()` 时把 `proven = not b["cut"]` 弄丢，
+    分数 / 步数 / 道具价全都对，只有报告文案从「这就是最省」退化成
+    「可能还有更省的同分解」——`regress.py` 的四项断言抓不到这种漂移。
+
+    顺带钉住「B 不能一进去就被剪掉」：曾经试过让 B 复用 A 的 memo 做支配剪枝，
+    结果根状态早就在 A 的 memo 里 → B 第一步就 return，什么都没搜却报「已证明」。
+    """
+    sc = {
+        "name": "tie-proven",
+        "edges": [],                     # 只能靠道具跳，徒步无路
+        "nodes": {"0,0": "起点", "2,0": "诡秘"},
+        "start": [0, 0], "ap": 1, "grants": {},
+        "items": [{"name": "报废轮子", "uses": 1},      # 直线 2 格，价 2
+                  {"name": "标准引擎", "uses": 1}],     # 相邻 8 格，够不到 (2,0)
+        "values": {"起点": 0, "诡秘": 10},
+    }
+    s = RS.Solver(sc)
+    total, path, _hit = s.run()
+    lc = s.last_cost
+    b_expanded = s.phase_stats[1][1]["expanded"] if len(s.phase_stats) > 1 else 0
+    ok = (total == 10 and lc["cost"] == 2 and lc["tie_phase"]
+          and lc["cost_proven"] and b_expanded > 1)
+    return ok, (f"分 {total}（应 10），价 {lc['cost']}（应 2），tie_phase={lc['tie_phase']}，"
+                f"cost_proven={lc['cost_proven']}，B 展开 {b_expanded}（应 >1）")
+
+
+def t_verdict_four_states():
+    """四态判词的优先级必须钉死：**❌ > ⏳ > ⚠️ > ✅**（2026-11-02）。
+
+    起因（玩家审阅第 1 条）：旧版把「撞时间/节点上限」和「无可行解」都塞进 problems，
+    于是一次 `--max-time` 给少了，工具就报 `❌ 不可用`——**用搜索进度冒充数学结论**。
+    现在四态各管一段，这里锁住三件事：
+      1. `problems` 存在就是 ❌（exit 3），哪怕同时有 `unknown`；
+      2. 只有 `unknown` 是 ⏳（exit 4）——既不许降成 ❌，也不许升成 ✅；
+      3. 都没有时 ✅ 必须把「N 项输入待确认」写进**末行**（不能用一次 ✅ 把 OCR 风险盖掉）。
+    """
+    import route
+
+    def call(**kw):
+        base = {"problems": [], "unknown": [], "warnings": []}
+        base.update(kw)
+        return route.verdict(**base)
+
+    cases = []
+    line, code = call(problems=["格点拟合越出地图区"], unknown=["没搜完"])
+    cases.append(("problems 压过 unknown", line is None and code == 3, f"{line} / {code}"))
+    line, code = call(unknown=["预算内没找到可行解"])
+    cases.append(("没搜完 = ⏳ exit4", bool(line) and line.startswith("⏳") and code == 4,
+                  f"{line} / {code}"))
+    line, code = call(warnings=["撞到节点上限"])
+    cases.append(("未证明最优 = ⚠️ exit0",
+                  bool(line) and line.startswith("⚠️") and code == 0, f"{line} / {code}"))
+    line, code = call(pending=["起点（小人检测）"])
+    cases.append(("已证最优 = ✅ 且末行带待确认",
+                  bool(line) and line.startswith("✅ 可用") and "待确认" in line and code == 0,
+                  f"{line} / {code}"))
+    bad = [f"{n}（{d}）" for n, ok, d in cases if not ok]
+    return (not bad), ("；".join(f"{n}✅" for n, ok, _d in cases if ok)
+                       + ("；❌ " + "、".join(bad) if bad else ""))
+
+
+def t_labels_confirmed():
+    """`--labels-confirmed` 只许把**节点标签**升成事实（2026-11-02）。
+
+    玩家核过标签之后，OCR 那一项不该再挂「待确认」；但这条开关**不许顺手**把
+    徽章像素、右区拓扑、猜出来的起点也洗白——那三项各有各的检测，混淆它们
+    等于自己给 ✅ 放水。这里锁三件事：
+      · 没核过 → 待确认，且依据里写明是 OCR；
+      · 核过   → 事实；
+      · 图上没标签 → 根本不记这一项（None）。
+    """
+    import route
+
+    a = route.label_input(False, 12)
+    b = route.label_input(True, 12)
+    c = route.label_input(True, 0)
+    bad = []
+    if not (a and a[1] == "待确认" and "OCR" in a[2]):
+        bad.append(f"默认应「待确认 + OCR」：{a}")
+    if not (b and b[1] == "事实" and "核对" in b[2]):
+        bad.append(f"核过应升「事实」：{b}")
+    if c is not None:
+        bad.append(f"图上没标签应为 None：{c}")
+    return (not bad), ("；".join(bad) if bad
+                       else f"待确认 → 事实 ✅（{a[2]} → {b[2]}）")
+
+
+def t_normal_layer5_final():
+    """常规五层（左区没有命运所指）：终点仍然是**右区那一个**命运所指。
+
+    2026-11-02 修：`second_ending_setup` 以前在 `marker=False` 时直接 return、`final` 留 None，
+    route.py 于是走「五层读到命运所指但没能定出终点」分支 → **普通五层在全程追猎下必然 ❌**。
+    这条锁「常规五层也有坐标型终点」，同时锁 marker 局的行为不被改坏。
+    """
+    import build_scenario as BS
+
+    nodes = {"13,3": "命运所指", "2,1": "诡秘", "11,2": "右区作战"}
+    se = BS.second_ending_setup(5, nodes, 9, answer=None)
+    nodes2 = dict(nodes, **{"3,1": "命运所指", "5,3": "命运所指"})
+    nodes2["2,1"] = "命运所指"
+    se2 = BS.second_ending_setup(5, nodes2, 9, answer=False)
+    bad = []
+    if se["marker"]:
+        bad.append("常规五层不该有 marker")
+    if se["final"] != (13, 3):
+        bad.append(f"常规五层 final 应为 (13,3)，实际 {se['final']}")
+    if se2["final"] != (13, 3):
+        bad.append(f"marker 局（不要）final 应为 (13,3)，实际 {se2['final']}")
+    if se["clamp"] or se["must"]:
+        bad.append(f"常规五层不该有钳制/必走点：{se['clamp']} {se['must']}")
+    return (not bad), ("；".join(bad) if bad
+                       else f"常规五层 final={se['final']}；marker 局 final={se2['final']} ✅")
+
+
+def t_start_missing_is_clean_error():
+    """小人没检出时必须是**干净判词**，不能 traceback（2026-11-02）。
+
+    两个实际崩溃点：
+      ① 滚动模式 `--visited` + 无起点 → `resolve_start` 里 `tuple(None)` → TypeError；
+      ② 判词「输入可信度」`_start_weak` 里 `tuple(start)` → TypeError
+         （二层构型1 的 (0,0) 恰好是合法格时，会一路走到这里）。
+    """
+    import route
+
+    problems, notes = [], []
+    s1, w1 = route.resolve_start(None, None, False, [], set(), set(),
+                                 set(), [], 4, "L5", problems, notes)
+    problems2, notes2 = [], []
+    s2, _w2 = route.resolve_start(None, (0, 0), False, [], {(0, 0)}, {(0, 0)},
+                                  set(), [((0, 0), (1, 0))], 2, "1", problems2, notes2)
+    bad = []
+    if not (s1 is None and w1 and any("起点未检测到" in p for p in problems)):
+        bad.append(f"滚动/无构型起点应判「起点未检测到」：{problems}")
+    if not (s2 is None and any("起点未检测到" in p for p in problems2)):
+        bad.append(f"有构型起点也应判「起点未检测到」：{problems2}")
+    return (not bad), ("；".join(bad) if bad else "两种入口都干净判错 ✅")
+
+
+def t_right_dots_left_zone_rejected():
+    """`--right-dots` 报**左区**坐标必须被拦下（2026-11-02）。
+
+    左区「空地」是 -99 硬墙；一旦把它当右区空地写进 `block_except` + 定价 0，
+    就等于在左区**凭空开一条 0 分通道**（路线能从墙里穿过去，还不报错）。
+    `build_scenario.right_zone()` 一直有这道过滤，route.py 漏了同一道闸。
+    """
+    import route
+
+    keep, bad = route.split_right_dots([(9, 3), (7, 1), (10, 2)], 7)
+    bad2, badzone = route.split_right_dots([], 7)
+    ok = (keep == [(9, 3), (10, 2)] and bad == [(7, 1)]
+          and bad2 == [] and badzone == [])
+    return ok, f"keep={keep} 拦下={bad}（lm=7）"
+
+
+def t_right_shape_dropped():
+    """没报 `--right-dots` 时：端点落在**未探知空地**上的形状表边要如实报出来（2026-11-02）。
+
+    以前 `dropped` **恒为空**（旧「空地=硬墙」口径的遗留）：`right_zone` 明明把那些边丢掉了，
+    却从不报告 → `validation_status` 里 `if _rz_meta.get("dropped")` 是死分支，判词还写着
+    「已核验」。现在锁三件事：
+      · 无 dots → 已知格之间的边照连，**丢掉的边非空**（结论偏保守）；
+      · 给了 dots（空地坐标已知）→ `dropped == []`，边数补齐；
+      · `right_zone` 把 `dropped` 回填进 meta（validation_status / route.py 靠它降级）。
+    """
+    import build_scenario as BS
+
+    sh = next(x for x in BS._parse_right_shapes(3) if x["name"] == "构型1")
+    shift = 3
+    cells = {(x, shift + dy) for (x, dy) in sh["cells"]}
+    empty = (9, shift - 1)                 # 竖链中间那格 = 构型1 唯一的空地
+    observed = cells - {empty}
+
+    how1, _n1, _c1, eg1, dropped1 = BS.match_right_shape(3, observed)
+    how2, _n2, _c2, eg2, dropped2 = BS.match_right_shape(3, observed, dots=[empty])
+
+    grid = {q: ("未知的诡秘", 1.0, 0) for q in observed}
+    meta, meta2 = {}, {}
+    BS.right_zone(3, grid, set(), [], 6, meta=meta)
+    BS.right_zone(3, grid, set(), [], 6, meta=meta2, dots=[empty])
+
+    bad = []
+    if how1 != "table" or len(eg1) != 4:
+        bad.append(f"无 dots：应 table + 4 条已知边，实际 {how1} / {len(eg1)}")
+    if not dropped1:
+        bad.append("无 dots：dropped 不该为空（端点未知的边没接进图）")
+    if not all(set(e) - observed for e in dropped1):
+        bad.append(f"丢掉的边必须都碰到未探知格：{dropped1}")
+    if how2 != "table" or len(eg2) != 7 or dropped2:
+        bad.append(f"给了 dots：应 table + 7 条边 + dropped==[]，实际 {how2} / {len(eg2)} / {dropped2}")
+    if not meta.get("dropped"):
+        bad.append("right_zone 没把 dropped 回填进 meta")
+    if meta2.get("dropped"):
+        bad.append(f"给了 dots 后 meta['dropped'] 必须为空：{meta2.get('dropped')}")
+    return (not bad), ("；".join(bad) if bad
+                       else f"无 dots：4 边 + 丢 {len(dropped1)} 条；有 dots：7 边 + dropped=[] ✅")
+
+
 def _json_load(path):
     import json as _json
     return _json.load(open(path, encoding="utf-8"))
@@ -2206,8 +2572,16 @@ TESTS = [
     ("地标判据是子集不是交集", t_landmark_subset_not_intersection),
     ("派生名还原 + 带宽覆盖 1/2 层", t_base_type_and_band_coverage),
     ("右区固定节点数要校验", t_right_zone_count_checked),
+    ("右区边表按形状表（不再四邻接）", t_right_zone_shape_table),
     ("DEFAULT_VALUES 与 rules 对齐", t_default_values_match_rules),
     ("solve_scan 扫描件保留 only/exclude", t_solve_scan_prep_keeps_land),
+    # ── 2026-11-02 P0：限时/节点上限必须真的停 ──
+    ("run(max_time) 真的按时停", t_run_time_limit_really_stops),
+    ("跑完的搜索不带「撞上限」", t_run_complete_has_no_cut_reason),
+    # ── 2026-11-02 P2/P4：--cov 优先级 + 扫描的收敛/证明语义 ──
+    ("solve_scan --cov 压过原型件", t_solve_scan_cov_precedence),
+    ("solve_scan 截断不报「不再增值」", t_solve_scan_truncated_is_not_converged),
+    ("solve_scan 达界才算证明", t_solve_scan_bound_stop_is_proof),
     ("observe 六层自动构型 / config_cells 分层表", t_observe_layer6_and_config_cells),
     ("apply_config 认识险路尽头模式", t_apply_config_end_mode),
     ("check_scenario --allow-extra", t_check_scenario_allow_extra),
@@ -2257,6 +2631,17 @@ TESTS = [
     # ── 2026-10-31 五层二结局 ──
     ("五层二结局：定价/终点/必走/未答拦截", t_second_ending_layer5),
     ("五层二结局：进命运所指后加工品次数强制→1", t_clamp_items_after_fate),
+    # ── 2026-11-02 求解器性能重构 ──
+    ("阶段 B 真跑且标「最省已证明」", t_tie_phase_proves_cost),
+    # ── 2026-11-02 判词语义：没搜完 ≠ 无解 ≠ 不可用 ──
+    ("四态判词：❌ > ⏳ > ⚠️ > ✅（末行契约）", t_verdict_four_states),
+    # ── 2026-11-02 输入可信度：玩家可声明标签已核 ──
+    ("--labels-confirmed 只洗标签那一项", t_labels_confirmed),
+    # ── 2026-11-02 审计修复：常规五层终点 / 起点缺失 / 左区圆点 ──
+    ("常规五层：无左区命运所指也有终点", t_normal_layer5_final),
+    ("起点没检出 → 干净判错，不 traceback", t_start_missing_is_clean_error),
+    ("--right-dots 报左区坐标要拦下（左区空地被当墙）", t_right_dots_left_zone_rejected),
+    ("右区形状表：未报 dots 时「没接进来的边」要如实报", t_right_shape_dropped),
 ]
 
 

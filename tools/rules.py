@@ -33,8 +33,10 @@ import re
 #   any    = 任意节点（可再用 only / exclude 收窄）
 COVS = ("adj8", "adj12", "line2", "line3", "row_col", "any")
 
-# 「无需行动力」的 4 件（01-加工品 原文标注，不是推测）
-FREE_ITEMS = ("重弹簧", "小八界", "一次性喷气背包", "简易遥控器")
+# 「无需行动力」的 4 件（01-加工品 原文标注）**不在这里手写**：
+# 2026-11-02 P0 审计——这行原来是「第二份真源」，全项目**零引用**，
+# 却随时可能与 ITEM_DEFS[...]["free"] 分家（改一处忘一处就是下一个漂移）。
+# 现在 FREE_ITEMS 由 ITEM_DEFS 派生，见下方 PRICE 之后。
 
 # 「作战家族」的前缀：地图上显示成「未知的凶戾」的格子，落地一定是 作战/紧急作战；
 # 树根也显示成紧急作战（所以鸣笛能直飞树根、融雪不能落树根）。
@@ -86,6 +88,10 @@ ITEM_DEFS = {
 
 # 消耗权重表（玩家口径，单位=源石锭购买价）。缺省的按 2 处理。
 PRICE = {n: d["price"] for n, d in ITEM_DEFS.items() if "price" in d}
+
+# 「无需行动力」的 4 件 —— **派生值，不许手写**。
+# `rules.py --check` 会独立再算一遍并与它比对（防止有人把常量抄回来）。
+FREE_ITEMS = tuple(n for n, d in ITEM_DEFS.items() if d.get("free"))
 
 # 行动力授予（节点自带效果）——不要散落在各脚本里
 GRANT_AP = {"树根": 2, "理想源": 2, "羽瞰点": 1}
@@ -655,6 +661,56 @@ def layer5_plan_text(layer):
             "最后一步 = 左区带徽章的「命运所指」（需要全图移动件）")
 
 
+# ---------------------------------------------------------------------------
+# 规则状态的**快照 / 恢复 / 清空**（2026-11-02 P0）
+#
+# 上面七个开关（分队模式、终点模式、四结局×2、三结局×2、二结局）都是模块级全局，
+# 一改全进程生效。单局 CLI 天生没问题，但：
+#   · `solve_scan.py` 在同一进程里连续建多个 Solver（每建一次就重放一遍 sc）；
+#   · `selftest_solver.py` 以前靠**手写 22 处** `set_*(None)` 复位；
+#   · 以后任何「一个进程跑多份 scenario」的脚本（扫描器换模式、批量复盘），
+# 漏复位 = 把上一份的答案带进下一份，而且**不报错，只是算错**。
+#
+# 这一层不改变任何调用签名（121 处模块级调用照旧），只把「拍现场 / 还原现场」
+# 变成一条语句，让测试和批处理不必再手抄复位清单。
+# `route_solver.Solver.__init__` 现在从 scenario 重放全部七项（见那里），
+# 所以单份求解是自洽的；这里服务的是「同一进程里的相邻两份」。
+# ---------------------------------------------------------------------------
+_STATE_KEYS = ("mode", "end_mode", "four_ending", "four_ending_pre",
+               "three_ending", "three_ending_pre", "second_ending")
+
+
+def snapshot():
+    """把当前七项规则状态拍成 dict（可直接 json 化，便于写进日志/回归用例）。
+
+    值域：模式是内部短名，问询是 True/False/None（None = 还没问）。
+    """
+    return {"mode": _MODE, "end_mode": _END_MODE,
+            "four_ending": _FOUR_ENDING, "four_ending_pre": _FOUR_ENDING_PRE,
+            "three_ending": _THREE_ENDING, "three_ending_pre": _THREE_ENDING_PRE,
+            "second_ending": _SECOND_ENDING}
+
+
+def restore(snap):
+    """按 snapshot() 的结果还原；缺键 = 还原成 None（未设定）。
+
+    走各自的 setter，所以非法值仍会抛错（不会把脏状态塞回全局）。
+    """
+    snap = snap or {}
+    set_mode(snap.get("mode"))
+    set_end_mode(snap.get("end_mode"))
+    set_four_ending(snap.get("four_ending"))
+    set_four_ending_pre(snap.get("four_ending_pre"))
+    set_three_ending(snap.get("three_ending"))
+    set_three_ending_pre(snap.get("three_ending_pre"))
+    set_second_ending(snap.get("second_ending"))
+
+
+def reset_all():
+    """七项全部回到「未设定」= 默认分队/终点模式 + 所有问询未答。"""
+    restore(None)
+
+
 # 险路尽头模式下，各层「最后一步可以落进」的节点类型（**元组：任一即可，第一个是主类型**）。
 # 2026-10-30 玩家口径（含同日修正）：
 #   **一/四层**：险路小径与险路尽头同待遇——不再排除（永不 block）、同分值（都 0）、
@@ -783,6 +839,11 @@ def ending_value_map(layer):
 #   · 带橡果的**林间空地**从 `block` 里豁免（`block_except`），地基按 0 起算 → 12 分；
 #   · 求解器按 `Solver.cell_value()` 读（pval / 走法 / fmt 同源）。
 #   ⛔ 不要再退回「不改价 + 同分优先」：那会变成「愿意为它少拿 1 分」。
+# ⑥ **性质（2026-11-02 补）**：12 是**模型估值**，不是实测固定收益——
+#    上面 ①–④ 每一步都是假设（m 步数 / p 零件 / D 位移 / 折算系数 k=0.47）。
+#    假设一动 12 就该动；**断点表**见 `references/27-三结局徽章.md`「性质：模型估值」一节，
+#    最危险的一条是：k 换成行商锚点 0.33 时分值 ≈8.7，直接跌破「紧急作战 9」。
+#    代码只负责给一个可复现的数，**合理性靠人复核**（`--check` 只钉排序锚点）。
 # ---------------------------------------------------------------------------
 ACORN_VALUE = 12.0
 
@@ -1038,6 +1099,106 @@ def _clean(name):
     return str(name).strip().strip('"“”\' ').strip()
 
 
+# ---------------------------------------------------------------------------
+# 库存条目校验（2026-11-02 P0）——**所有入口共用一把尺子**
+#
+# 为什么必须有：`parse_items_spec`（命令行）早就防住了负数/畸形数量，
+# 但 `normalize_item`（手写 scenario、其它脚本直接调）以前只有一句
+# `int(out.get("uses", 1))`，于是三类**不报错的错**能一路进求解器：
+#
+# | 输入 | 旧行为 | 后果 |
+# |---|---|---|
+# | `"uses": -3` | 直接吃下 | 负预算，路线整体偏保守 |
+# | `"only": "作战"` | `list("作战")` → `['作','战']` | **逐字前缀匹配，静默错配**（融雪能落作战、鸣笛飞不到凶戾） |
+# | `"bonus": -3` | 直接吃下 | 少给 3 点 AP，判词还报 ✅ |
+#
+# 上限只设**宽松哨兵**（99），抓「12 写成 1200」这类笔误，**不按耐久卡**：
+# 合法次数本就能到 6（2 件 × 3），六层夹到 1，`solve_scan` 的 k 也可能更大。
+# ---------------------------------------------------------------------------
+MAX_USES = 99
+MAX_BONUS = 99
+
+
+class BadItem(Exception):
+    """库存条目字段非法（负数次数 / 字符串 only / 负 bonus / 超范围）。"""
+
+
+def _as_int(v, what, lo=0, hi=None):
+    """把字段读成整数：只收 int / 纯数字字符串，拒 bool、float、脏字符串。"""
+    if isinstance(v, bool):                    # bool 是 int 的子类，必须先拦
+        raise BadItem("%s 不能是布尔值（%r）" % (what, v))
+    if isinstance(v, int):
+        n = v
+    elif isinstance(v, float):
+        if not v.is_integer():
+            raise BadItem("%s 必须是整数（%r）" % (what, v))
+        n = int(v)
+    elif isinstance(v, str):
+        s = v.strip()
+        if re.fullmatch(r"-\d+", s):
+            raise BadItem("%s 不能为负（%r）：0 = 已用完" % (what, v))
+        if not re.fullmatch(r"\d+", s):
+            raise BadItem("%s 必须是非负整数（%r）" % (what, v))
+        n = int(s)
+    else:
+        raise BadItem("%s 必须是整数（%r）" % (what, v))
+    if n < lo:
+        raise BadItem("%s 不能小于 %d（%r）" % (what, lo, v))
+    if hi is not None and n > hi:
+        raise BadItem("%s 超过合理上限 %d（%r）：是不是多写了一位？" % (what, hi, v))
+    return n
+
+
+def _as_prefix_list(v, what):
+    """only / exclude 必须是非空字符串的列表。
+
+    **字符串是这里最危险的输入**：`list("作战")` 会变成 `['作','战']`，
+    随后 `startswith` 按单字匹配——不抛错、只是整条路线按错的道具语义算。
+    """
+    if v is None:
+        return None
+    if isinstance(v, str):
+        raise BadItem('%s 要写成列表（如 ["作战"]），不能是字符串「%s」：'
+                      "字符串会被逐字拆成前缀，静默错配" % (what, v))
+    if not isinstance(v, (list, tuple)):
+        raise BadItem("%s 必须是列表（%r）" % (what, v))
+    out = []
+    for x in v:
+        if not isinstance(x, str) or not x.strip():
+            raise BadItem("%s 里只能放非空字符串（%r）" % (what, x))
+        out.append(x.strip())
+    return out
+
+
+def validate_item(ent):
+    """校验一条库存条目（**规范化之前**调用）；非法抛 `BadItem`，由入口统一判 ❌。
+
+    只查**写了的**字段：缺省值仍由 `normalize_item` 按 ITEM_DEFS 补。
+    名字不要求在 ITEM_DEFS 里——`solve_scan` 会造「标准引擎(扫描3)」这类派生名，
+    只要它自带 cov 就合法。
+    """
+    if not isinstance(ent, dict):
+        raise BadItem("库存条目必须是对象（dict），拿到 %r" % (ent,))
+    name = ent.get("name")
+    if not isinstance(name, str) or not _clean(name):
+        raise BadItem("库存条目的 name 必须是非空字符串（%r）" % (name,))
+    nm = _clean(name)
+    if "uses" in ent:
+        _as_int(ent["uses"], "「%s」的 uses（剩余次数）" % nm, 0, MAX_USES)
+    if "bonus" in ent:
+        _as_int(ent["bonus"], "「%s」的 bonus（额外行动力）" % nm, 0, MAX_BONUS)
+    for f, label in (("only", "only（只能落的类型）"),
+                     ("exclude", "exclude（不能落的类型）")):
+        if f in ent:
+            _as_prefix_list(ent[f], "「%s」的 %s" % (nm, label))
+    for f, label in (("free", "free（免行动力）"), ("random", "random（随机落点）")):
+        if f in ent and not isinstance(ent[f], (bool, int)):
+            raise BadItem("「%s」的 %s 必须是 true/false（%r）" % (nm, label, ent[f]))
+    if "cov" in ent and ent["cov"] not in COVS:
+        raise BadItem("「%s」的 cov「%s」不在 %s 里" % (nm, ent["cov"], "/".join(COVS)))
+    return ent
+
+
 def item_def(name):
     return ITEM_DEFS.get(_clean(name))
 
@@ -1182,9 +1343,14 @@ def normalize_item(ent):
     手写 json 常常只写 {"name": "一次性喷气背包", "uses": 1}：
     缺 cov 会让求解器 KeyError，缺 free 会让它白扣行动力，
     缺 bonus 会让遥控器少 3 点 AP。这里统一补齐，**不改显式写明的值**。
+
+    2026-11-02 P0：补齐之前先过 `validate_item()`——命令行与手写 JSON
+    必须是**同一把尺子**（负数次数、字符串 only/exclude、负 bonus 全部抛 BadItem）。
+    `uses` 只收非负整数（`0` = 已用完，合法）；`bonus` 同理。
     """
     if not isinstance(ent, dict) or "name" not in ent:
         raise UnknownItem(str(ent))
+    validate_item(ent)
     d = item_def(ent["name"]) or {}
     out = dict(ent)
     out["name"] = _clean(ent["name"])
@@ -1194,7 +1360,8 @@ def normalize_item(ent):
         out["cov"] = d["cov"]
     if out["cov"] not in COVS:
         raise UnknownItem("%s 的 cov「%s」不在 %s 里" % (out["name"], out["cov"], COVS))
-    out["uses"] = int(out.get("uses", 1))
+    out["uses"] = _as_int(out.get("uses", 1),
+                          "「%s」的 uses（剩余次数）" % out["name"], 0, MAX_USES)
     for f in ("only", "exclude"):
         if out.get(f) is None and d.get(f):
             out[f] = list(d[f])
@@ -1202,7 +1369,9 @@ def normalize_item(ent):
     out.setdefault("only", None)
     out["exclude"] = list(out.get("exclude") or [])
     out["free"] = bool(out["free"]) if "free" in out else bool(d.get("free", False))
-    out["bonus"] = int(out["bonus"]) if "bonus" in out else int(d.get("bonus", 0))
+    out["bonus"] = (_as_int(out["bonus"], "「%s」的 bonus（额外行动力）" % out["name"],
+                            0, MAX_BONUS)
+                    if "bonus" in out else int(d.get("bonus", 0)))
     if "random" not in out and d.get("random"):
         out["random"] = True
     return out
@@ -1235,6 +1404,196 @@ def layer_values(layer):
     return vals
 
 
+# ---------------------------------------------------------------------------
+# 规则不变式（`python tools/rules.py --check`，2026-11-02 P1）
+#
+# 注释拦不住漂移。这文件里每段「口径来源」都是人在 10 月一条条补的，
+# 补完就再没有东西验它——于是出现「FREE_ITEMS 定义后零引用」「缺键被
+# `vals.get(t,0)` 静默按 0 算」这类事故。这里把**能机械验的**关系钉死，
+# 并按 分队 2 × 终点 2 × 四结局 3 × 前置 3 共 36 组开关组合遍历（跑完还原现场）。
+#
+# 只验**结构关系**，不验数值偏好：改价格不会让它变红（那是 regress 的定价指纹管），
+# 改出矛盾才会。
+# ---------------------------------------------------------------------------
+def _check_free_items():
+    bad = []
+    derived = tuple(n for n, d in ITEM_DEFS.items() if d.get("free"))
+    if tuple(FREE_ITEMS) != derived:
+        bad.append("FREE_ITEMS 与 ITEM_DEFS 的 free 标记不一致：%s ≠ %s"
+                   % (list(FREE_ITEMS), list(derived)))
+    return bad
+
+
+def _check_item_roundtrip():
+    bad = []
+    for n in available_items():
+        try:
+            out = normalize_item(make_item(n))
+        except Exception as exc:                       # noqa: BLE001 - 报给人看
+            bad.append("「%s」make_item→normalize_item 失败：%s" % (n, exc))
+            continue
+        d = ITEM_DEFS[n]
+        if out["cov"] != d["cov"]:
+            bad.append("「%s」cov 往返变了：%s → %s" % (n, d["cov"], out["cov"]))
+        if out["uses"] != default_uses(n):
+            bad.append("「%s」uses 往返变了：%s → %s" % (n, default_uses(n), out["uses"]))
+        if not isinstance(out["exclude"], list):
+            bad.append("「%s」exclude 不是 list（%r）" % (n, out["exclude"]))
+        if out["free"] != bool(d.get("free")):
+            bad.append("「%s」free 往返变了：%r" % (n, out["free"]))
+        if out["bonus"] != int(d.get("bonus", 0)):
+            bad.append("「%s」bonus 往返变了：%r" % (n, out["bonus"]))
+    return bad
+
+
+def _combat_like(t):
+    """这个类型名是否属于「作战家族」（鸣笛能飞、融雪/小八界落不了的那族）。"""
+    b = base_type(t)
+    return ("作战" in b) or ("凶戾" in b) or b in ("树根", "理想源")
+
+
+def _check_combat_prefixes():
+    bad = []
+    pre = expand_prefixes(COMBAT_PREFIXES)
+    names = set()
+    for tab in LAYER_PRICES.values():
+        names.update(tab)
+    names.update(RIGHT_RENAME.values())
+    names.update(ACORN_PASS_TYPES)
+    names.update(ACORN_STAY_BLOCKED)
+    for t in sorted(names):
+        if _combat_like(t) and not any(t.startswith(p) for p in pre):
+            bad.append("作战家族前缀漏了「%s」（鸣笛 only / 融雪 exclude 会静默错配）" % t)
+    return bad
+
+
+def _check_layer_tables():
+    bad = []
+    for layer in sorted(LAYER_PRICES):
+        tab = LAYER_PRICES[layer]
+        for t in _COMMON:
+            if t not in tab:
+                bad.append("层 %d 价表缺「%s」（会被 values.get(t,0) 静默按 0 算）" % (layer, t))
+        # 每层都该显式定价的基础类型。右区 / 线人 / 居民据点 / 秘境行商 / 狭路相逢
+        # 不是每层都有，不进这张必备表（它们在别的层缺失是设计，不是漏）。
+        for t in ("空地", "作战", "凶戾", "诡秘", "不期而遇", "得偿所愿", "诡意行商"):
+            if t not in tab:
+                bad.append("层 %d 价表缺基础类型「%s」（会被静默按 0 算）" % (layer, t))
+        if layer in (3, 4, 5):
+            for t in _RIGHT:
+                if t not in tab:
+                    bad.append("层 %d 价表缺右区类型「%s」" % (layer, t))
+        for t in ending_types(layer):
+            if t not in tab:
+                bad.append("层 %d 价表缺终点类型「%s」" % (layer, t))
+        vals = layer_values(layer)
+        for t, v in vals.items():
+            if not isinstance(v, (int, float)):
+                bad.append("层 %d 的 layer_values[%s]=%r 不是数字" % (layer, t, v))
+        if is_end_jintou():
+            for t in ending_types(layer):
+                v = vals.get(t)
+                if isinstance(v, (int, float)) and v < 0:
+                    bad.append("险路尽头模式下 层 %d 的终点「%s」被定价为负（%r）："
+                               "终点是硬约束，负分会让求解器宁可不收尾" % (layer, t, v))
+    return bad
+
+
+def _check_ending_consistency():
+    bad = []
+    for layer in sorted(LAYER_ENDING):
+        types = ending_types(layer)
+        hard = ending_hard_types(layer)
+        for t in hard:
+            if t not in types:
+                bad.append("层 %d 硬终点「%s」不在 ending_types 里" % (layer, t))
+        extra = set(hard) - set(HARD_ENDING)
+        if extra and not (layer == 2 and extra == {"险路小径"}):
+            bad.append("层 %d 出现非 HARD_ENDING 的硬终点 %s" % (layer, sorted(extra)))
+        # 一层/四层的小径是**软终点**：进了硬终点表会把「必经小径」的中继提前截断
+        if layer in (1, 4) and "险路小径" in hard:
+            bad.append("层 %d 的「险路小径」被当成硬终点（它必须可停可续）" % layer)
+    return bad
+
+
+def _check_anchors():
+    bad = []
+    t3 = LAYER_PRICES[3]
+    chain = [("紧急作战", float(t3.get("紧急作战", 9))),
+             ("橡果", float(ACORN_VALUE)),
+             ("树根", float(t3.get("树根", 15))),
+             ("右区作战", float(t3.get("右区作战", 16)))]
+    for (n1, v1), (n2, v2) in zip(chain, chain[1:]):
+        if not v1 < v2:
+            bad.append("价格锚点不单调：%s=%g 应小于 %s=%g" % (n1, v1, n2, v2))
+    dex = float(LAYER_PRICES[5].get("得偿所愿", 8))
+    if not dex < ACORN_VALUE:
+        bad.append("价格锚点：得偿所愿=%g 应小于橡果=%g" % (dex, ACORN_VALUE))
+    return bad
+
+
+def _check_derived_rules():
+    bad = []
+    if SECOND_FATE_VALUE_DELTA < 0:
+        bad.append("SECOND_FATE_VALUE_DELTA=%r 不能为负（命运所指收益要低于得偿所愿，但不该更高）"
+                   % SECOND_FATE_VALUE_DELTA)
+    want = float(LAYER_PRICES[5]["得偿所愿"]) - SECOND_FATE_VALUE_DELTA
+    got = second_fate_random_value(5)
+    if abs(got - want) > 1e-9:
+        bad.append("second_fate_random_value(5)=%g 与价表脱钩（应为 %g）" % (got, want))
+    if not 0 < got < float(LAYER_PRICES[5]["得偿所愿"]):
+        bad.append("无徽章命运所指=%g 应落在 (0, 本层得偿所愿 %g) 之间"
+                   % (got, LAYER_PRICES[5]["得偿所愿"]))
+    for layer in sorted(LAYER_PRICES):
+        if "险路小径" not in LAYER_PRICES[layer]:
+            bad.append("层 %d 价表缺「险路小径」（它可进可出，缺键会被按 0 算）" % layer)
+        for t in grant_ok_types():
+            if t not in GRANT_AP:
+                bad.append("grant_ok_types() 里的「%s」不在 GRANT_AP" % t)
+    return bad
+
+
+_CHECKS = (
+    ("FREE_ITEMS 与 ITEM_DEFS 同源", _check_free_items),
+    ("道具定义往返", _check_item_roundtrip),
+    ("作战家族前缀覆盖", _check_combat_prefixes),
+    ("分层价表覆盖", _check_layer_tables),
+    ("终点类型一致性", _check_ending_consistency),
+    ("价格锚点单调", _check_anchors),
+    ("派生规则不脱钩", _check_derived_rules),
+)
+
+# 36 = 2 分队 × 2 终点 × 3 四结局 × 3 前置
+_CHECK_COMBOS = len(MODES) * len(END_MODES) * 3 * 3
+
+
+def check_invariants(verbose=False):
+    """跑全部不变式，返回问题列表（空 = 通过）。跑完**一定**还原原来的开关状态。"""
+    problems = []
+    snap = snapshot()
+    try:
+        for mode_name in MODES:
+            for end_name in END_MODES:
+                for four in (None, True, False):
+                    for pre in (None, True, False):
+                        set_mode(mode_name)
+                        set_end_mode(end_name)
+                        set_four_ending(four)
+                        set_four_ending_pre(pre)
+                        tag = "[%s+%s 四结局=%s 前置=%s]" % (
+                            mode_label(mode_name), end_name,
+                            {None: "未问", True: "要", False: "不要"}[four],
+                            {None: "未问", True: "已获取", False: "未获取"}[pre])
+                        for title, fn in _CHECKS:
+                            if verbose:
+                                print("  · %s %s" % (tag, title))
+                            for p in fn():
+                                problems.append("%s %s：%s" % (tag, title, p))
+    finally:
+        restore(snap)
+    return problems
+
+
 def describe_items():
     """给人看的对照表（tools/rules.py 与 references/01 的同一份内容）。"""
     rows = []
@@ -1262,4 +1621,14 @@ if __name__ == "__main__":
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
+    if "--check" in sys.argv[1:]:
+        print("== 规则不变式（%d 组开关组合）==" % _CHECK_COMBOS)
+        bad = check_invariants(verbose="--verbose" in sys.argv[1:])
+        if bad:
+            print("❌ 未通过：%d 条" % len(bad))
+            for b in bad:
+                print("   - " + b)
+            sys.exit(1)
+        print("✅ 全部通过")
+        sys.exit(0)
     print(describe_items())
